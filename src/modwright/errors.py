@@ -20,6 +20,10 @@ class ErrorCode(StrEnum):
     INVALID_INSTALL_ROOT = "invalid_install_root"
     #: No mod project (or no ModWright config) at the given path.
     PROJECT_NOT_FOUND = "project_not_found"
+    #: Scaffolding would overwrite a project that is already there.
+    PROJECT_EXISTS = "project_exists"
+    #: Mod name is not usable as a C# assembly name and namespace.
+    INVALID_MOD_NAME = "invalid_mod_name"
     #: `dotnet build`/`publish` returned non-zero.
     BUILD_FAILED = "build_failed"
     #: Destination file is locked, which almost always means the game is running.
@@ -63,6 +67,14 @@ class InvalidInstallRootError(ModwrightError):
 
 class ProjectNotFoundError(ModwrightError):
     code = ErrorCode.PROJECT_NOT_FOUND
+
+
+class ProjectExistsError(ModwrightError):
+    code = ErrorCode.PROJECT_EXISTS
+
+
+class InvalidModNameError(ModwrightError):
+    code = ErrorCode.INVALID_MOD_NAME
 
 
 class BuildFailedError(ModwrightError):

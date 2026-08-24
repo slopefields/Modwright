@@ -90,7 +90,7 @@ def scaffold_mod_project(
         install_root=str(context.install_root),
         game_name=context.game_name,
     )
-    config.save(project)
+    written.append(config.save(project))
 
     return {
         "success": True,
