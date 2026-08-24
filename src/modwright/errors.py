@@ -28,6 +28,11 @@ class ErrorCode(StrEnum):
     BUILD_FAILED = "build_failed"
     #: Destination file is locked, which almost always means the game is running.
     ARTIFACT_LOCKED = "artifact_locked"
+    #: Deploy target is not a usable loader tree for this framework.
+    INVALID_DEPLOY_ROOT = "invalid_deploy_root"
+    #: More than one place this mod could be installed, and none was chosen.
+    #: Not a failure to be retried -- the user has to pick.
+    DEPLOY_TARGET_UNSET = "deploy_target_unset"
     #: The framework's log file does not exist yet (game never run since install).
     LOG_NOT_FOUND = "log_not_found"
     #: DecompilerServer could not be reached or returned an error.
@@ -41,15 +46,25 @@ class ModwrightError(Exception):
 
     code: ErrorCode = ErrorCode.NOT_IMPLEMENTED
 
-    def __init__(self, message: str, *, hints: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        hints: list[str] | None = None,
+        details: dict | None = None,
+    ) -> None:
         super().__init__(message)
         self.message = message
         self.hints = hints or []
+        #: Structured data the agent needs to act on the failure -- the list of
+        #: profiles to choose between, say. Hints are prose; this is not.
+        self.details = details or {}
 
     def to_response(self) -> dict:
         payload: dict = {"success": False, "code": str(self.code), "error": self.message}
         if self.hints:
             payload["hints"] = self.hints
+        payload.update(self.details)
         return payload
 
 
@@ -83,6 +98,14 @@ class BuildFailedError(ModwrightError):
 
 class ArtifactLockedError(ModwrightError):
     code = ErrorCode.ARTIFACT_LOCKED
+
+
+class InvalidDeployRootError(ModwrightError):
+    code = ErrorCode.INVALID_DEPLOY_ROOT
+
+
+class DeployTargetUnsetError(ModwrightError):
+    code = ErrorCode.DEPLOY_TARGET_UNSET
 
 
 class LogNotFoundError(ModwrightError):

@@ -11,6 +11,7 @@ from __future__ import annotations
 import re
 import shutil
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 from xml.sax.saxutils import escape as xml_escape
 
@@ -18,10 +19,17 @@ from modwright.errors import (
     ArtifactLockedError,
     BuildFailedError,
     Il2CppUnsupportedError,
+    InvalidDeployRootError,
     InvalidModNameError,
     ProjectExistsError,
 )
-from modwright.models import BuildOutcome, DeployOutcome, GameContext, PatchTarget
+from modwright.models import (
+    BuildOutcome,
+    DeployOutcome,
+    GameContext,
+    LoaderInfo,
+    PatchTarget,
+)
 from modwright.patches import extract_harmony_targets
 
 #: Mod names become both an assembly name and a C# namespace, so they are held
@@ -120,6 +128,9 @@ def _compiler_errors(build_output: str, limit: int = 15) -> list[str]:
 class BepInEx5Adapter:
     framework_id = "bepinex5"
     display_name = "BepInEx 5"
+    # BepInEx mods are a loose DLL copied into a loader tree, and that tree
+    # can live anywhere -- the game folder or any mod-manager profile.
+    supports_deploy_target = True
 
     def detect(self, install_root: Path) -> GameContext | None:
         """Structural sniff of a Unity install root.
@@ -162,6 +173,71 @@ class BepInEx5Adapter:
             framework_id=self.framework_id,
             managed_dir=managed_dir,
             mods_dir=bepinex_dir / "plugins",
+        )
+
+    def inspect_loader_root(self, loader_root: Path) -> LoaderInfo | None:
+        loader_dir = loader_root / "BepInEx"
+        if not (loader_dir / "core").is_dir():
+            # Either not a BepInEx tree at all, or one with no loader in it.
+            # Both are unusable, and discovery should offer neither.
+            return None
+        log_path = loader_dir / "LogOutput.log"
+        return LoaderInfo(
+            mods_dir=loader_dir / "plugins",
+            log_path=log_path if log_path.exists() else None,
+        )
+
+    def adopt_loader_root(
+        self, game_context: GameContext, loader_root: Path
+    ) -> GameContext:
+        """Redirect deploy and logs at a mod-manager profile.
+
+        A profile is recognised the same way an install is -- by containing a
+        BepInEx tree -- rather than by living under a path we recognise, so
+        this works for managers ModWright has never heard of and for a loader
+        tree assembled by hand.
+        """
+        if not loader_root.exists():
+            # Distinct from a wrong path: this is usually a target that was
+            # valid when it was chosen and has since been deleted or renamed.
+            raise InvalidDeployRootError(
+                f"{loader_root} no longer exists.",
+                hints=[
+                    "If this was a mod-manager profile, it may have been "
+                    "deleted or renamed. Pick another with list_mod_profiles, "
+                    "or recreate it in the mod manager.",
+                ],
+            )
+
+        loader_dir = loader_root / "BepInEx"
+        if not loader_dir.is_dir():
+            # A profile with no BepInEx is the normal state of a NEW profile:
+            # managers do not install the loader until the first mod is added.
+            raise InvalidDeployRootError(
+                f"{loader_root} has no BepInEx installed.",
+                hints=[
+                    "If this is a new profile, install BepInEx into it -- "
+                    "installing any mod through the manager pulls it in, or "
+                    "install the BepInEx pack on its own.",
+                    "If this was meant to be a game install, check the path.",
+                ],
+            )
+        # `core` holds the loader itself. Without it the tree is a shell --
+        # exactly the state that accepted a deployed DLL and loaded nothing.
+        if not (loader_dir / "core").is_dir():
+            raise InvalidDeployRootError(
+                f"{loader_root} has a BepInEx folder but no BepInEx/core, so "
+                "the loader itself is missing.",
+                hints=[
+                    "Nothing deployed here would load. Reinstall BepInEx into "
+                    "this profile, or pick another with list_mod_profiles.",
+                ],
+            )
+
+        return replace(
+            game_context,
+            loader_root=loader_root,
+            mods_dir=loader_dir / "plugins",
         )
 
     def scaffold(
@@ -326,7 +402,17 @@ class BepInEx5Adapter:
 
         plugins_dir = game_context.mods_dir
         assert plugins_dir is not None  # guaranteed by detect()
-        plugins_dir.mkdir(parents=True, exist_ok=True)
+        # Create `plugins` if BepInEx is there but has never been populated;
+        # never conjure the whole tree. `parents=True` on a mistyped root
+        # would build a directory nothing ever loads from and report success.
+        if not plugins_dir.is_dir():
+            if not plugins_dir.parent.is_dir():
+                raise InvalidDeployRootError(
+                    f"{plugins_dir.parent} does not exist, so {plugins_dir} "
+                    "is not a place this game loads mods from.",
+                    hints=["Check the deploy target with list_mod_profiles."],
+                )
+            plugins_dir.mkdir()
         destination = plugins_dir / outcome.artifact.name
 
         try:
@@ -351,5 +437,11 @@ class BepInEx5Adapter:
         return extract_harmony_targets(mod_source_dir)
 
     def resolve_log(self, game_context: GameContext) -> Path | None:
-        log_path = game_context.install_root / "BepInEx" / "LogOutput.log"
+        """The log belongs to whichever loader tree actually runs.
+
+        With a mod-manager profile that is the profile's own LogOutput.log,
+        not the game folder's -- which may be stale or never written at all.
+        """
+        root = game_context.effective_loader_root
+        log_path = root / "BepInEx" / "LogOutput.log"
         return log_path if log_path.exists() else None

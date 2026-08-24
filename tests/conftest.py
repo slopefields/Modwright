@@ -113,6 +113,38 @@ def fake_game(tmp_path: Path):
 
 
 @pytest.fixture()
+def fake_profile(tmp_path: Path):
+    """Build a synthetic mod-manager profile tree.
+
+    Mirrors the layout r2modman/Thunderstore Mod Manager/Gale produce: a
+    standalone loader tree with no game assemblies anywhere near it.
+    """
+
+    def _build(
+        name: str = "dev",
+        *,
+        manager: str = "r2modmanPlus-local",
+        game_folder: str = "FakeGame",
+        core: bool = True,
+        plugins: bool = True,
+        log: bool = False,
+    ) -> Path:
+        root = tmp_path / manager / game_folder / "profiles" / name
+        loader = root / "BepInEx"
+        loader.mkdir(parents=True, exist_ok=True)
+        if core:
+            (loader / "core").mkdir(exist_ok=True)
+        if plugins:
+            (loader / "plugins").mkdir(exist_ok=True)
+        if log:
+            (loader / "LogOutput.log").write_text("start\n", encoding="utf-8")
+        (root / "doorstop_config.ini").write_text("enabled = true\n", encoding="utf-8")
+        return root
+
+    return _build
+
+
+@pytest.fixture()
 def mod_source(tmp_path: Path):
     """Write C# into a throwaway mod directory and return the directory."""
 

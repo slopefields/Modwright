@@ -30,6 +30,37 @@ class GameContext:
     #: whose build step places the artifact itself (see `BuildOutcome`).
     mods_dir: Path | None = None
 
+    #: Directory holding the *loader* tree, when it lives outside the game
+    #: install. Normally None, meaning loader and game share `install_root`.
+    #:
+    #: Mod managers (r2modman, Thunderstore Mod Manager, Gale) break that
+    #: assumption: each profile is a complete standalone loader tree elsewhere
+    #: on disk, and the game is launched pointed at it. The game install still
+    #: supplies the assemblies to compile and decompile against, so the two
+    #: roots have to be tracked separately -- `managed_dir` follows the game,
+    #: `mods_dir` and the log follow the loader.
+    loader_root: Path | None = None
+
+    @property
+    def effective_loader_root(self) -> Path:
+        """Where the loader actually lives -- the profile, or the install."""
+        return self.loader_root or self.install_root
+
+
+@dataclass(frozen=True)
+class LoaderInfo:
+    """What an adapter can tell from a loader tree alone, with no game.
+
+    Mod-manager profiles are loader trees sitting on their own -- no game
+    install anywhere near them -- so they have to be understood without the
+    usual detection path.
+    """
+
+    mods_dir: Path
+    #: The loader's log, when it has been written. None means this tree has
+    #: never actually run.
+    log_path: Path | None = None
+
 
 @dataclass(frozen=True)
 class BuildOutcome:

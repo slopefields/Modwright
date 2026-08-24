@@ -28,6 +28,7 @@ from modwright.models import (
     BuildOutcome,
     DeployOutcome,
     GameContext,
+    LoaderInfo,
     PatchTarget,
 )
 
@@ -40,6 +41,15 @@ class ModFrameworkAdapter(Protocol):
     framework_id: str
     #: Human-readable name for tool responses.
     display_name: str
+    #: Whether mods for this framework can be installed somewhere other than
+    #: the game install -- a mod-manager profile.
+    #:
+    #: False for frameworks where the question does not arise: tModLoader and
+    #: SMAPI place the artifact during the build, so there is no destination
+    #: to choose. Adapters with this False must refuse `adopt_loader_root`
+    #: rather than half-supporting it, and callers must not ask the user to
+    #: pick a target they cannot use.
+    supports_deploy_target: bool
 
     def detect(self, install_root: Path) -> GameContext | None:
         """Return a context if this adapter handles the install, else None.
@@ -48,6 +58,36 @@ class ModFrameworkAdapter(Protocol):
         the registry try the next adapter. Raise only for a positively wrong
         situation the user needs told about, such as an IL2CPP game whose real
         code no IL decompiler can read.
+        """
+        ...
+
+    def inspect_loader_root(self, loader_root: Path) -> LoaderInfo | None:
+        """Describe a standalone loader tree, or None if it is not this one's.
+
+        Lets profile discovery stay framework-agnostic: what a loader tree
+        looks like -- `BepInEx/core` here, `Mods/` and `MelonLoader/` for
+        MelonLoader -- is knowledge that belongs in each adapter, not in a
+        shared scanner that would otherwise hardcode whichever framework came
+        first.
+
+        Recognition must mean *usable*, not merely present: a tree missing the
+        loader itself accepts a deployed file and loads nothing.
+        """
+        ...
+
+    def adopt_loader_root(
+        self, game_context: GameContext, loader_root: Path
+    ) -> GameContext:
+        """Point deploy and log resolution at a loader tree outside the game.
+
+        Mod managers keep each profile as a standalone loader tree, so the
+        install that owns the assemblies is not the install that loads mods.
+        The returned context must keep `managed_dir` on the game (that is
+        where the assemblies are) while moving `mods_dir` onto `loader_root`.
+
+        Must raise `InvalidDeployRootError` if the path is not a loader tree
+        this adapter recognises, rather than creating one: a mistyped path
+        would otherwise silently become a directory nothing ever reads.
         """
         ...
 

@@ -8,7 +8,7 @@ being moved or cloned, and never desynchronise from a central index.
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
 from modwright.errors import ProjectNotFoundError
@@ -22,6 +22,10 @@ class ProjectConfig:
     framework_id: str
     install_root: str
     game_name: str
+    #: Loader tree to deploy into, when it is not the game install -- a mod
+    #: manager profile. Optional and defaulted so configs written before this
+    #: existed still load.
+    deploy_root: str | None = None
 
     def save(self, project_path: Path) -> Path:
         path = project_path / CONFIG_FILENAME
@@ -37,4 +41,7 @@ class ProjectConfig:
                 hints=["Run scaffold_mod_project first, or pass the project root."],
             )
         data = json.loads(path.read_text(encoding="utf-8"))
-        return cls(**data)
+        # Ignore unknown keys rather than crashing: a project written by a
+        # newer ModWright should still open in an older one.
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in data.items() if k in known})
