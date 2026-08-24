@@ -20,6 +20,7 @@ from modwright.errors import LogNotFoundError, ModwrightError
 from modwright.logs import read_since
 from modwright.models import GameContext
 from modwright.project_config import ProjectConfig
+from modwright.validation import validate_targets
 
 mcp = MCPServer("modwright")
 
@@ -35,6 +36,19 @@ def _tool(fn: Callable[..., Any]) -> Callable[..., Any]:
     def wrapper(*args: Any, **kwargs: Any) -> dict[str, Any]:
         try:
             return fn(*args, **kwargs)
+        except ModwrightError as exc:
+            return exc.to_response()
+
+    return wrapper
+
+
+def _async_tool(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """`_tool` for coroutine tools -- those that call DecompilerServer."""
+
+    @functools.wraps(fn)
+    async def wrapper(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        try:
+            return await fn(*args, **kwargs)
         except ModwrightError as exc:
             return exc.to_response()
 
@@ -101,20 +115,53 @@ def scaffold_mod_project(
 
 
 @mcp.tool()
-@_tool
-def validate_mod_patches(project_path: str) -> dict[str, Any]:
-    """Check that every target the mod patches actually exists in the game.
+@_async_tool
+async def validate_mod_patches(project_path: str) -> dict[str, Any]:
+    """Check that every method the mod patches actually exists in the game.
 
-    Catches typos and renamed-by-a-game-update targets before compiling, which
-    is exactly the class of bug that otherwise only shows up as a silent
-    no-op at runtime.
+    Harmony takes its target method name as a plain string, so the compiler
+    never checks it -- a typo or a name changed by a game update builds fine
+    and only fails when the game launches and `PatchAll` cannot resolve it.
+    This runs that same lookup against the game assembly's metadata first.
     """
     context, adapter, _ = _context_for_project(Path(project_path))
-    targets = adapter.extract_patch_targets(Path(project_path))
+    extracted = adapter.extract_patch_targets(Path(project_path))
+
+    # Targets whose attribute arguments were not literals cannot be checked
+    # without compiling; they are reported as unchecked rather than passed.
+    unresolved = [t for t in extracted if t.unresolved_reason]
+    checkable = [t for t in extracted if not t.unresolved_reason]
+
+    validated = await validate_targets(checkable, context)
+    missing = [v for v in validated if not v.exists]
+
     return {
         "success": True,
-        "targets_found": len(targets),
-        "targets": [t.display for t in targets],
+        "valid": not missing,
+        "checked": len(validated),
+        "missing": [
+            {
+                "target": v.target.display,
+                "file": str(v.target.source_file),
+                "line": v.target.line,
+                "did_you_mean": v.candidates,
+            }
+            for v in missing
+        ],
+        "found": [
+            {"target": v.target.display, "line": v.target.line}
+            for v in validated
+            if v.exists
+        ],
+        "unchecked": [
+            {
+                "target": t.display,
+                "file": str(t.source_file),
+                "line": t.line,
+                "reason": t.unresolved_reason,
+            }
+            for t in unresolved
+        ],
     }
 
 

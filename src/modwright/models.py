@@ -73,16 +73,24 @@ class PatchTarget:
     is decided later by looking it up through DecompilerServer.
     """
 
-    type_name: str
+    type_name: str | None
     member_name: str | None
     source_file: Path
     line: int
+    #: Set when the attribute was found but its arguments could not be read as
+    #: literals -- a `const` reference or computed string. Such targets are
+    #: reported as unchecked rather than guessed at or silently passed.
+    unresolved_reason: str | None = None
 
     @property
     def display(self) -> str:
-        if self.member_name is None:
+        if self.type_name and self.member_name:
+            return f"{self.type_name}.{self.member_name}"
+        if self.type_name:
             return self.type_name
-        return f"{self.type_name}.{self.member_name}"
+        if self.member_name:
+            return f"?.{self.member_name}"
+        return "?"
 
 
 @dataclass(frozen=True)

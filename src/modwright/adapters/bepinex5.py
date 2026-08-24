@@ -15,7 +15,6 @@ from pathlib import Path
 from xml.sax.saxutils import escape as xml_escape
 
 from modwright.errors import (
-    AdapterStepNotImplementedError,
     ArtifactLockedError,
     BuildFailedError,
     Il2CppUnsupportedError,
@@ -23,6 +22,7 @@ from modwright.errors import (
     ProjectExistsError,
 )
 from modwright.models import BuildOutcome, DeployOutcome, GameContext, PatchTarget
+from modwright.patches import extract_harmony_targets
 
 #: Mod names become both an assembly name and a C# namespace, so they are held
 #: to C# identifier rules rather than silently mangled into something that
@@ -347,14 +347,8 @@ class BepInEx5Adapter:
         return DeployOutcome(destination=destination, copied=True)
 
     def extract_patch_targets(self, mod_source_dir: Path) -> list[PatchTarget]:
-        """Not implemented yet -- see `modwright.patches`.
-
-        BepInEx mods patch via Harmony attributes, so this will delegate to the
-        shared Harmony extractor rather than implementing its own parsing.
-        """
-        raise AdapterStepNotImplementedError(
-            "Harmony patch-target extraction is not implemented yet."
-        )
+        """BepInEx mods patch via Harmony, so the shared extractor applies."""
+        return extract_harmony_targets(mod_source_dir)
 
     def resolve_log(self, game_context: GameContext) -> Path | None:
         log_path = game_context.install_root / "BepInEx" / "LogOutput.log"

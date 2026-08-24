@@ -101,6 +101,31 @@ class DecompilerClient:
     async def get_decompiled_source(self, member_id: str) -> dict[str, Any]:
         return await self._call("get_decompiled_source", {"memberId": member_id})
 
+    async def list_members(
+        self, type_id: str, max_pages: int = 5
+    ) -> list[dict[str, Any]]:
+        """Every member of one type, following pagination.
+
+        Bounded by `max_pages` so a pathologically large type cannot stall a
+        lookup; a few hundred members is far past what suggestions need.
+        """
+        members: list[dict[str, Any]] = []
+        cursor: str | None = None
+
+        for _ in range(max_pages):
+            arguments: dict[str, Any] = {"typeId": type_id, "mode": "signatures"}
+            if cursor:
+                arguments["cursor"] = cursor
+            data = await self._call("list_members", arguments)
+            members.extend(data.get("items", []))
+            if not data.get("hasMore"):
+                break
+            cursor = data.get("nextCursor")
+            if not cursor:
+                break
+
+        return members
+
 
 def _first_text(result: Any) -> str:
     for block in getattr(result, "content", []):
