@@ -1,0 +1,32 @@
+PLAN.txt
+CLAUDE.md
+
+# Local MCP client config: holds absolute paths to this machine's
+# DecompilerServer build. README documents the shape instead.
+.mcp.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+dist/
+build/
+
+# .NET
+bin/
+obj/
+
+# Local data / logs
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.log
+
+# OS / editor
+.vs/
+.vscode/
+Thumbs.db
+.DS_Store

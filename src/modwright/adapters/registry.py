@@ -1,0 +1,49 @@
+"""Adapter lookup: install root -> the adapter that handles it."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from modwright.adapters.base import ModFrameworkAdapter
+from modwright.adapters.bepinex5 import BepInEx5Adapter
+from modwright.errors import InvalidInstallRootError, UnsupportedGameError
+from modwright.models import GameContext
+
+#: Ordered: the first adapter whose `detect` claims the install wins. Generic
+#: multi-game loaders come before per-game ones, since a game carrying an
+#: installed loader should be driven through that loader.
+ADAPTERS: tuple[ModFrameworkAdapter, ...] = (BepInEx5Adapter(),)
+
+
+def get_adapter(framework_id: str) -> ModFrameworkAdapter:
+    for adapter in ADAPTERS:
+        if adapter.framework_id == framework_id:
+            return adapter
+    raise UnsupportedGameError(
+        f"No adapter registered for framework {framework_id!r}.",
+        hints=[f"Known frameworks: {', '.join(a.framework_id for a in ADAPTERS)}"],
+    )
+
+
+def detect_framework(install_root: Path | str) -> GameContext:
+    """Identify the modding framework for a game install.
+
+    Raises `UnsupportedGameError` when nothing claims it, rather than guessing
+    -- a clear refusal is more useful to an agent than a half-working adapter.
+    """
+    root = Path(install_root)
+    if not root.is_dir():
+        raise InvalidInstallRootError(f"Not a directory: {root}")
+
+    for adapter in ADAPTERS:
+        context = adapter.detect(root)
+        if context is not None:
+            return context
+
+    raise UnsupportedGameError(
+        f"No supported modding framework detected at {root}.",
+        hints=[
+            "ModWright v1 supports BepInEx 5 (Mono Unity games).",
+            "Confirm the game is installed and its mod loader has been set up.",
+        ],
+    )

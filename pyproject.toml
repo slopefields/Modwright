@@ -1,0 +1,25 @@
+[project]
+name = "modwright-mcp"
+version = "0.1.0"
+description = "MCP server for the C# game mod development lifecycle: scaffold, validate, build, deploy, and observe mods."
+requires-python = ">=3.11"
+dependencies = [
+    # Provides both halves we need: the server (mcp.server.MCPServer) and the
+    # client used to call DecompilerServer (mcp.Client). The 2.0 SDK renamed
+    # FastMCP to MCPServer, so the floor is 2.0 rather than 1.x.
+    "mcp>=2.0.0",
+    # Parses the MOD's own source to extract patch targets. Never used on game
+    # assemblies -- that is DecompilerServer's job.
+    "tree-sitter>=0.21",
+    "tree-sitter-c-sharp>=0.21",
+]
+
+[project.scripts]
+modwright-mcp = "modwright.server:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
