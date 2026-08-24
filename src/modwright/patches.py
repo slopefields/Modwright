@@ -37,6 +37,22 @@ _LANGUAGE = Language(tree_sitter_c_sharp.language())
 #: namespace-qualified.
 _PATCH_ATTRIBUTE_NAMES = frozenset({"HarmonyPatch", "HarmonyPatchAttribute"})
 
+#: Attributes marking a method as the body of a patch. A method carrying one
+#: of these is a handler even with no `[HarmonyPatch]` of its own, because the
+#: containing class supplied the target.
+_PATCH_ROLE_ATTRIBUTES = frozenset(
+    {
+        "HarmonyPrefix",
+        "HarmonyPostfix",
+        "HarmonyTranspiler",
+        "HarmonyFinalizer",
+        "HarmonyReversePatch",
+    }
+)
+
+#: Harmony also accepts these names by convention, with no attribute at all.
+_PATCH_ROLE_NAMES = frozenset({"Prefix", "Postfix", "Transpiler", "Finalizer"})
+
 #: Declarations that can carry Harmony patches and contain patch methods.
 _TYPE_DECLARATIONS = frozenset({"class_declaration", "struct_declaration"})
 
@@ -48,13 +64,23 @@ class _PatchSpec:
     type_name: str | None = None
     method_name: str | None = None
     unresolved: str | None = None
+    #: Whether this declaration carried any Harmony attribute at all. Used to
+    #: tell a patch handler from an ordinary helper method sitting in the same
+    #: class, which must not be reported as a target.
+    is_patch_role: bool = False
 
     def merged_with(self, fallback: "_PatchSpec") -> "_PatchSpec":
-        """Layer this spec over one from an enclosing declaration."""
+        """Layer this spec over one from an enclosing declaration.
+
+        `is_patch_role` deliberately does not inherit: the enclosing class
+        being a patch class says nothing about whether a given method inside
+        it is a patch handler.
+        """
         return _PatchSpec(
             type_name=self.type_name or fallback.type_name,
             method_name=self.method_name or fallback.method_name,
             unresolved=self.unresolved or fallback.unresolved,
+            is_patch_role=self.is_patch_role,
         )
 
     @property
@@ -101,8 +127,13 @@ def _collect(
             continue
 
         if child.type == "method_declaration":
-            spec = _read_patch_attributes(child, source).merged_with(inherited)
-            if not spec.is_empty:
+            own = _read_patch_attributes(child, source)
+            if not own.is_patch_role and _method_name(child, source) in _PATCH_ROLE_NAMES:
+                # Harmony's naming convention: a method called Postfix inside a
+                # patch class is a handler even with no attribute.
+                own.is_patch_role = True
+            spec = own.merged_with(inherited)
+            if spec.is_patch_role and not spec.is_empty:
                 out.append(
                     PatchTarget(
                         type_name=spec.type_name,
@@ -129,11 +160,21 @@ def _read_patch_attributes(declaration: Node, source: bytes) -> _PatchSpec:
             if attribute.type != "attribute":
                 continue
             name = _text(attribute.named_children[0], source).rsplit(".", 1)[-1]
+            bare = name.removesuffix("Attribute")
+            if bare in _PATCH_ROLE_ATTRIBUTES:
+                spec.is_patch_role = True
+                continue
             if name not in _PATCH_ATTRIBUTE_NAMES:
                 continue
+            spec.is_patch_role = True
             _read_arguments(attribute, source, spec)
 
     return spec
+
+
+def _method_name(declaration: Node, source: bytes) -> str:
+    name = declaration.child_by_field_name("name")
+    return _text(name, source) if name is not None else ""
 
 
 def _read_arguments(attribute: Node, source: bytes, spec: _PatchSpec) -> None:

@@ -14,8 +14,23 @@ dependencies = [
     "tree-sitter-c-sharp>=0.21",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+]
+
 [project.scripts]
 modwright-mcp = "modwright.server:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "game: needs a real supported game installed locally (see conftest)",
+    "decompiler: needs a DecompilerServer build (MODWRIGHT_DECOMPILER_PATH)",
+    "dotnet: needs the .NET SDK on PATH",
+]
 
 [build-system]
 requires = ["setuptools>=68"]
