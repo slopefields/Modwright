@@ -19,6 +19,7 @@ from mcp.server import MCPServer
 from modwright.adapters import detect_framework, get_adapter
 from modwright.diagnosis import diagnose_empty_log
 from modwright.errors import (
+    BuildFailedError,
     DeployTargetUnsetError,
     LogNotFoundError,
     ModReferenceNotFoundError,
@@ -285,7 +286,18 @@ def build_mod(project_path: str) -> dict[str, Any]:
     needed.
     """
     context, adapter, config = _context_for_project(Path(project_path))
-    outcome = adapter.build(Path(project_path))
+    try:
+        outcome = adapter.build(Path(project_path))
+    except BuildFailedError as exc:
+        # Only when the build breaks. A dependency's assembly timestamp moves
+        # every time it is rebuilt and redeployed, which during development is
+        # most of the time -- reported on every passing build it would be
+        # constant noise and quickly tuned out. Beside a real failure it is
+        # worth knowing, so it is attached there and nowhere else.
+        changed = _changed_references(context, config)
+        if changed:
+            exc.details.setdefault("reference_warnings", []).extend(changed)
+        raise
     response = {
         "success": True,
         "artifact": str(outcome.artifact) if outcome.artifact else None,
@@ -297,6 +309,57 @@ def build_mod(project_path: str) -> dict[str, Any]:
     if drift:
         response["reference_warnings"] = drift
     return response
+
+
+def _installed_dependencies(
+    context: GameContext, config: ProjectConfig
+) -> list[Any]:
+    """Installed mods, minus this project's own deployed build output.
+
+    A project deploys into the same folder it reads dependencies from, so once
+    dependencies installed as a bare file are visible, the project's own
+    artifact sitting right there would be offered back to it. Matched on name
+    rather than on a filename, which keeps the framework's file extension out
+    of here.
+    """
+    if context.mods_dir is None:
+        return []
+    own = config.mod_name.lower()
+    return [m for m in list_installed_mods(context.mods_dir) if m.package.lower() != own]
+
+
+def _changed_references(context: GameContext, config: ProjectConfig) -> list[str]:
+    """Dependencies whose assembly has moved since the reference was added.
+
+    What a version cannot answer for a dependency installed as a bare file,
+    which carries no manifest to hold one. Reported as an observation: a
+    dependency changing and a method name being misspelled produce the same
+    compiler error, and nothing here can tell them apart.
+    """
+    if not config.references or context.mods_dir is None:
+        return []
+
+    warnings: list[str] = []
+    for reference in config.references:
+        if reference.assembly_mtime_when_added is None:
+            continue
+        installed = find_installed_mod(context.mods_dir, reference.package)
+        if installed is None:
+            continue  # Already reported, as missing, by `_reference_drift`.
+        now = installed.last_changed
+        if now is not None and now != reference.assembly_mtime_when_added:
+            warnings.append(
+                f"{reference.package} has changed on disk since this project "
+                f"started referencing it "
+                f"(now {_isoformat_stamp(now)}, was "
+                f"{_isoformat_stamp(reference.assembly_mtime_when_added)}). "
+                "If the build only just started failing, check that first."
+            )
+    return warnings
+
+
+def _isoformat_stamp(mtime: float) -> str:
+    return datetime.fromtimestamp(mtime).isoformat(timespec="seconds")
 
 
 def _reference_drift(context: GameContext, config: ProjectConfig) -> list[str]:
@@ -411,7 +474,7 @@ def list_available_mods(project_path: str) -> dict[str, Any]:
     already installed in the deploy target, so it matches the version the game
     will actually load and nothing has to be downloaded or copied.
     """
-    context, _, _ = _context_for_project(Path(project_path))
+    context, _, config = _context_for_project(Path(project_path))
     if context.mods_dir is None:
         return {"success": True, "mods": []}
 
@@ -426,7 +489,7 @@ def list_available_mods(project_path: str) -> dict[str, Any]:
                 "assemblies": [a.name for a in mod.assemblies],
                 "referenceable": mod.referenceable,
             }
-            for mod in list_installed_mods(context.mods_dir)
+            for mod in _installed_dependencies(context, config)
         ],
     }
 
@@ -461,6 +524,14 @@ def add_mod_reference(project_path: str, package: str) -> dict[str, Any]:
                 "list_available_mods shows what is installed.",
             ],
         )
+    if mod.package.lower() == config.mod_name.lower():
+        # This project deploys into the folder it reads dependencies from, so
+        # its own artifact is sitting there among them.
+        raise ModReferenceNotFoundError(
+            f"{mod.package} is this project's own build output, not a "
+            "dependency it can compile against.",
+            hints=["A project cannot reference itself."],
+        )
     if not mod.referenceable:
         raise ModReferenceNotFoundError(
             f"{mod.package} ships no assembly that can be referenced.",
@@ -473,7 +544,11 @@ def add_mod_reference(project_path: str, package: str) -> dict[str, Any]:
 
     config.references = [r for r in config.references if r.package != mod.package]
     config.references.append(
-        ModReference(package=mod.package, version_when_added=mod.version)
+        ModReference(
+            package=mod.package,
+            version_when_added=mod.version,
+            assembly_mtime_when_added=mod.last_changed,
+        )
     )
     config.save(project)
 

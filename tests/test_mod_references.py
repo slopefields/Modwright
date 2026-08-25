@@ -10,6 +10,7 @@ assemblies that must not be referenced.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 
 import pytest
@@ -17,9 +18,13 @@ import pytest
 from modwright import server
 from modwright.adapters import detect_framework
 from modwright.adapters.bepinex5 import REFERENCES_FILENAME, BepInEx5Adapter
+from modwright.errors import BuildFailedError
+from modwright.models import BuildOutcome
 from modwright.mods import find_installed_mod, list_installed_mods, read_installed_mod
 from modwright.project_config import ModReference, ProjectConfig
 from modwright.server import _reference_drift
+
+from conftest import _pe_bytes
 
 
 @pytest.fixture()
@@ -130,11 +135,40 @@ class TestLookup:
     def test_unknown_package_is_none(self, mods_dir):
         assert find_installed_mod(mods_dir, "NotInstalled") is None
 
-    def test_listing_skips_loose_files(self, mods_dir):
-        (mods_dir / "SomeMod.dll").write_bytes(b"")
+    def test_listing_includes_loose_assemblies(self, mods_dir):
+        """A dependency need not be a folder. A library taken from a release
+        page, or a locally built mod, is a bare file -- and keeping only
+        directories made those invisible to add_mod_reference entirely."""
+        (mods_dir / "SomeMod.dll").write_bytes(_pe_bytes(managed=True))
+
         assert [m.package for m in list_installed_mods(mods_dir)] == [
-            "xilophor-StaticNetcodeLib"
+            "SomeMod",
+            "xilophor-StaticNetcodeLib",
         ]
+
+    def test_a_loose_assembly_is_referenceable_and_has_no_version(self, mods_dir):
+        """No manifest sits beside a bare file, so there is no version to
+        read. None is recorded rather than one invented from the assembly's
+        own metadata, which routinely disagrees with the released version."""
+        (mods_dir / "SomeMod.dll").write_bytes(_pe_bytes(managed=True))
+
+        loose = next(m for m in list_installed_mods(mods_dir) if m.package == "SomeMod")
+        assert loose.referenceable
+        assert loose.version is None
+        assert [a.name for a in loose.assemblies] == ["SomeMod.dll"]
+
+    def test_a_loose_native_library_is_not_referenceable(self, mods_dir):
+        """The same PE check that protects packages protects loose files:
+        referencing a native DLL fails the build outright."""
+        (mods_dir / "opus.dll").write_bytes(_pe_bytes(managed=False))
+
+        loose = next(m for m in list_installed_mods(mods_dir) if m.package == "opus")
+        assert not loose.referenceable
+        assert "native" in loose.skipped[0].reason
+
+    def test_loose_files_that_are_not_assemblies_are_ignored(self, mods_dir):
+        (mods_dir / "readme.txt").write_text("not a mod", encoding="utf-8")
+        assert "readme" not in [m.package for m in list_installed_mods(mods_dir)]
 
 
 class TestGeneratedReferenceFile:
@@ -222,8 +256,9 @@ class TestTools:
         result = server.add_mod_reference(str(path), "Lib")
 
         assert result["success"]
-        assert ProjectConfig.load(path).references == [
-            ModReference(package="a-Lib", version_when_added="1.1.1")
+        stored = ProjectConfig.load(path).references
+        assert [(r.package, r.version_when_added) for r in stored] == [
+            ("a-Lib", "1.1.1")
         ]
 
     def test_adding_twice_does_not_duplicate(self, project, installed_mod):
@@ -333,4 +368,109 @@ class TestVersionDrift:
         server.add_mod_reference(str(path), "a-Lib")
 
         stored = json.loads((path / ".modwright.json").read_text(encoding="utf-8"))
-        assert set(stored["references"][0]) == {"package", "version_when_added"}
+        # Everything stored is an "at the time it was added" fact. Nothing
+        # here describes what is installed *now* -- that is read from disk.
+        assert set(stored["references"][0]) == {
+            "package",
+            "version_when_added",
+            "assembly_mtime_when_added",
+        }
+
+
+class TestOwnOutputIsNotADependency:
+    """A project deploys into the same folder it reads dependencies from, so
+    once bare files are visible its own artifact is sitting among them."""
+
+    def _deploy_own_output(self, context, mod_name="MyMod"):
+        artifact = context.mods_dir / f"{mod_name}.dll"
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact.write_bytes(_pe_bytes(managed=True))
+        return artifact
+
+    def test_not_offered_in_the_listing(self, project, installed_mod):
+        path, context = project
+        installed_mod(context.mods_dir, "a-Lib", {"Lib.dll": "managed"})
+        self._deploy_own_output(context)
+
+        listed = server.list_available_mods(str(path))["mods"]
+        assert [m["package"] for m in listed] == ["a-Lib"]
+
+    def test_referencing_itself_is_refused_with_a_reason(self, project):
+        path, context = project
+        self._deploy_own_output(context)
+
+        result = server.add_mod_reference(str(path), "MyMod")
+
+        assert result["success"] is False
+        assert "own build output" in result["error"]
+
+    def test_a_real_dependency_is_still_reachable(self, project, installed_mod):
+        """The exclusion must not swallow anything but the project itself."""
+        path, context = project
+        installed_mod(context.mods_dir, "a-Lib", {"Lib.dll": "managed"})
+        self._deploy_own_output(context)
+
+        assert server.add_mod_reference(str(path), "a-Lib")["success"]
+
+
+class TestChangedDependencyHint:
+    """A bare file has no version, so 'has it moved' is the only question that
+    can be answered about it. Reported only when a build fails."""
+
+    def _touch(self, path, *, seconds: int = 60):
+        when = os.stat(path).st_mtime + seconds
+        os.utime(path, (when, when))
+
+    def test_a_changed_dependency_is_reported_when_the_build_fails(
+        self, project, installed_mod, monkeypatch
+    ):
+        path, context = project
+        package = installed_mod(context.mods_dir, "a-Lib", {"Lib.dll": "managed"})
+        server.add_mod_reference(str(path), "a-Lib")
+        self._touch(package / "Lib.dll")
+
+        monkeypatch.setattr(
+            BepInEx5Adapter, "build",
+            lambda self, p: (_ for _ in ()).throw(BuildFailedError("nope")),
+        )
+        result = server.build_mod(str(path))
+
+        assert result["success"] is False
+        assert any(
+            "changed on disk" in w for w in result["reference_warnings"]
+        )
+
+    def test_an_unchanged_dependency_says_nothing(
+        self, project, installed_mod, monkeypatch
+    ):
+        path, context = project
+        installed_mod(context.mods_dir, "a-Lib", {"Lib.dll": "managed"})
+        server.add_mod_reference(str(path), "a-Lib")
+
+        monkeypatch.setattr(
+            BepInEx5Adapter, "build",
+            lambda self, p: (_ for _ in ()).throw(BuildFailedError("nope")),
+        )
+        result = server.build_mod(str(path))
+
+        assert result["success"] is False
+        assert "reference_warnings" not in result
+
+    def test_a_passing_build_never_carries_the_hint(
+        self, project, installed_mod, monkeypatch
+    ):
+        """The timestamp moves every time a dependency is rebuilt and
+        redeployed, so on a passing build this would be constant noise."""
+        path, context = project
+        package = installed_mod(context.mods_dir, "a-Lib", {"Lib.dll": "managed"})
+        server.add_mod_reference(str(path), "a-Lib")
+        self._touch(package / "Lib.dll")
+
+        monkeypatch.setattr(
+            BepInEx5Adapter, "build",
+            lambda self, p: BuildOutcome(artifact=p / "out.dll"),
+        )
+        result = server.build_mod(str(path))
+
+        assert result["success"] is True
+        assert "reference_warnings" not in result

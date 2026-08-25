@@ -67,6 +67,22 @@ class InstalledMod:
     def referenceable(self) -> bool:
         return bool(self.assemblies)
 
+    @property
+    def last_changed(self) -> float | None:
+        """When the newest referenced assembly was written, or None.
+
+        The question this answers is "did anything in here change", so a
+        package shipping several assemblies (DawnLib ships four) reports the
+        newest of them rather than trying to nominate a main one.
+        """
+        stamps = []
+        for assembly in self.assemblies:
+            try:
+                stamps.append(assembly.stat().st_mtime)
+            except OSError:
+                continue
+        return max(stamps, default=None)
+
 
 def is_managed_assembly(path: Path) -> bool:
     """True if this DLL is .NET, false if it is native code.
@@ -140,15 +156,52 @@ def read_installed_mod(package_dir: Path) -> InstalledMod:
     )
 
 
+def read_loose_assembly(dll: Path) -> InstalledMod:
+    """Describe a dependency installed as a bare file rather than a folder.
+
+    Named for the file itself, since there is no package folder to take a name
+    from. It carries no manifest and therefore no version -- see
+    `list_installed_mods` for why none is invented.
+    """
+    if not is_managed_assembly(dll):
+        reason = "native library, not a .NET assembly"
+    elif _is_framework_assembly(dll):
+        reason = "framework assembly; use a NuGet package instead"
+    else:
+        return InstalledMod(package=dll.stem, path=dll, assemblies=(dll,))
+    return InstalledMod(
+        package=dll.stem,
+        path=dll,
+        assemblies=(),
+        skipped=(SkippedAssembly(dll, reason),),
+    )
+
+
 def list_installed_mods(mods_dir: Path) -> list[InstalledMod]:
-    """Every package installed in a mods directory that could be referenced."""
+    """Every dependency in a mods directory that could be referenced.
+
+    Two shapes count, because both really occur side by side in one directory:
+    a package FOLDER, which a mod manager creates, and a LOOSE `.dll`, which
+    is what a library downloaded from a release page or a locally-built mod
+    looks like. Keeping only folders made the second kind invisible to
+    `add_mod_reference` entirely.
+
+    A loose file has no `manifest.json`, so it has no version. None is
+    recorded rather than read out of the assembly's own metadata: that
+    metadata is whatever the dependency's build happened to stamp, which is
+    routinely unrelated to the version the mod is actually released under, and
+    a wrong version presented as authoritative is worse than an absent one.
+    """
     if not mods_dir.is_dir():
         return []
-    return [
-        read_installed_mod(entry)
-        for entry in sorted(mods_dir.iterdir())
-        if entry.is_dir()
-    ]
+
+    found = []
+    for entry in sorted(mods_dir.iterdir()):
+        if entry.is_dir():
+            found.append(read_installed_mod(entry))
+        elif entry.suffix.lower() == ".dll":
+            found.append(read_loose_assembly(entry))
+    return found
 
 
 def find_installed_mod(mods_dir: Path, package: str) -> InstalledMod | None:

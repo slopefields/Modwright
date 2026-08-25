@@ -20,16 +20,29 @@ CONFIG_FILENAME = ".modwright.json"
 class ModReference:
     """A mod this project compiles against.
 
-    Only the package folder name and the version *at the time it was added*
-    are stored. The version currently installed is deliberately NOT cached:
-    it is a millisecond away in the profile, and a stored copy would go stale
-    the moment the user updates the mod, leaving two disagreeing answers to
-    the same question. What cannot be recovered later is what the version was
-    when the code was written against it -- so that is what gets recorded.
+    Only the package name and what was true *at the time it was added* are
+    stored. What is installed now is deliberately NOT cached: it is a
+    millisecond away in the profile, and a stored copy would go stale the
+    moment the user updates the mod, leaving two disagreeing answers to the
+    same question. What cannot be recovered later is what things looked like
+    when the code was written -- so that is what gets recorded.
+
+    Both fields are kept, each filled whenever it is knowable, because they
+    answer different questions: the version is "which release did I write
+    against" (read by the drift warning, and later by a packaging manifest's
+    dependency line), while the timestamp is "has this file moved underneath
+    me" (read only when a build fails). A dependency installed as a bare
+    `.dll` has no manifest and so no version; that absence means "not known"
+    and must not be repurposed to signal which shape the dependency came in.
     """
 
     package: str
     version_when_added: str | None = None
+    #: Modification time of the newest assembly this reference points at, as
+    #: of when it was added. Catches what a version cannot: a locally rebuilt
+    #: DLL swapped into an installed package leaves the manifest reading the
+    #: same version while the assembly is entirely different.
+    assembly_mtime_when_added: float | None = None
 
 
 @dataclass
