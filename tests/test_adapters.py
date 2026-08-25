@@ -82,3 +82,73 @@ class TestTargetFramework:
         root = fake_game("G", net_framework_profile=False)
         context = BepInEx5Adapter().detect(root)
         assert BepInEx5Adapter()._target_framework(context) == "netstandard2.1"
+
+
+class TestLoaderOutsideTheGameFolder:
+    """A mod manager keeps the loader in a profile and leaves the game install
+    untouched, so requiring BepInEx beside the game refused those users before
+    they could say where their loader actually is."""
+
+    def _profile(self, tmp_path, game_folder="CoolGame", name="Default"):
+        root = tmp_path / "r2modmanPlus-local" / game_folder / "profiles" / name
+        for sub in ("core", "plugins"):
+            (root / "BepInEx" / sub).mkdir(parents=True, exist_ok=True)
+        return root
+
+    def _use(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            "modwright.profiles.manager_data_dirs",
+            lambda: [tmp_path / "r2modmanPlus-local"],
+        )
+
+    def test_a_profile_elsewhere_is_enough_to_claim_the_game(
+        self, fake_game, tmp_path, monkeypatch
+    ):
+        game = fake_game("CoolGame", bepinex=False)
+        self._profile(tmp_path)
+        self._use(monkeypatch, tmp_path)
+
+        context = detect_framework(game)
+        assert context.framework_id == "bepinex5"
+        # Proof of framework, not a choice of destination: several profiles
+        # may exist and picking one is the user's call.
+        assert context.mods_dir is None
+
+    def test_doorstop_files_alone_claim_the_game(self, fake_game, monkeypatch):
+        """What a manager leaves in the game folder: the injector and its
+        config, with everything else in a profile we may not find."""
+        game = fake_game("CoolGame", bepinex=False)
+        (game / "winhttp.dll").write_bytes(b"")
+        (game / "doorstop_config.ini").write_text("enabled=true", encoding="utf-8")
+        monkeypatch.setattr("modwright.profiles.manager_data_dirs", lambda: [])
+
+        context = BepInEx5Adapter().detect(game)
+        assert context is not None
+        assert context.mods_dir is None
+
+    def test_one_doorstop_file_is_not_evidence(self, fake_game, monkeypatch):
+        """winhttp.dll is a common enough filename to mean nothing alone."""
+        game = fake_game("CoolGame", bepinex=False)
+        (game / "winhttp.dll").write_bytes(b"")
+        monkeypatch.setattr("modwright.profiles.manager_data_dirs", lambda: [])
+
+        assert BepInEx5Adapter().detect(game) is None
+
+    def test_a_mono_unity_game_with_no_loader_anywhere_is_still_declined(
+        self, fake_game, monkeypatch
+    ):
+        """Being Unity+Mono is not enough: RimWorld is both and loads mods
+        natively, with no BepInEx involved."""
+        game = fake_game("CoolGame", bepinex=False)
+        monkeypatch.setattr("modwright.profiles.manager_data_dirs", lambda: [])
+
+        assert BepInEx5Adapter().detect(game) is None
+        with pytest.raises(UnsupportedGameError):
+            detect_framework(game)
+
+    def test_a_loader_in_the_game_folder_still_sets_the_target(self, fake_game):
+        """The hand-installed case keeps working, and needs no question asked:
+        there is only one place the mod can go."""
+        game = fake_game("CoolGame")
+        context = BepInEx5Adapter().detect(game)
+        assert context.mods_dir == game / "BepInEx" / "plugins"

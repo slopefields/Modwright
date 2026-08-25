@@ -28,7 +28,12 @@ class TestGeneratedFiles:
     def test_writes_a_project_a_plugin_and_a_gitignore(self, scaffolded):
         project, written = scaffolded("MyMod")
         names = {path.name for path in written}
-        assert names == {"MyMod.csproj", "Plugin.cs", ".gitignore"}
+        assert names == {
+            "MyMod.csproj",
+            "Plugin.cs",
+            ".gitignore",
+            "Modwright.props",
+        }
         assert all(path.exists() for path in written)
 
     def test_project_is_named_after_the_mod(self, scaffolded):
@@ -47,14 +52,33 @@ class TestProjectReferences:
         """Hardcoding the install path would break the project on any other
         machine; GameDir can be overridden with -p:GameDir=..."""
         project, _ = scaffolded()
-        csproj = (project / "MyMod.csproj").read_text(encoding="utf-8")
-        assert "<GameDir Condition=\"'$(GameDir)' == ''\">" in csproj
+        props = (project / "Modwright.props").read_text(encoding="utf-8")
+        assert "<GameDir Condition=\"'$(GameDir)' == ''\">" in props
 
-    def test_paths_derive_from_game_dir_rather_than_repeating_it(self, scaffolded):
+    def test_machine_specific_paths_are_not_in_the_project_file(self, scaffolded):
+        """The .csproj is written once and never rewritten, so a path baked
+        into it goes stale the moment the deploy target changes. Paths belong
+        in the generated file, which is rewritten from the context."""
         project, _ = scaffolded()
         csproj = (project / "MyMod.csproj").read_text(encoding="utf-8")
-        assert "<GameManagedDir>$(GameDir)\\" in csproj
-        assert "<BepInExCoreDir>$(GameDir)\\BepInEx\\core</BepInExCoreDir>" in csproj
+
+        assert "<GameDir" not in csproj
+        assert "<LoaderDir" not in csproj
+        assert "Modwright.props" in csproj
+
+    def test_paths_derive_from_their_roots_rather_than_repeating_them(self, scaffolded):
+        project, _ = scaffolded()
+        props = (project / "Modwright.props").read_text(encoding="utf-8")
+        assert "<GameManagedDir>$(GameDir)\\" in props
+        assert "<BepInExCoreDir>$(LoaderDir)\\BepInEx\\core</BepInExCoreDir>" in props
+
+    def test_the_loader_is_not_assumed_to_live_inside_the_game(self, scaffolded):
+        """BepInEx comes from LoaderDir, never GameDir. With a mod manager the
+        two differ, and compiling against the game folder's copy while running
+        the profile's is a silent version mismatch."""
+        project, _ = scaffolded()
+        props = (project / "Modwright.props").read_text(encoding="utf-8")
+        assert "$(GameDir)\\BepInEx" not in props
 
     def test_references_the_loader_and_game_assemblies(self, scaffolded):
         project, _ = scaffolded()

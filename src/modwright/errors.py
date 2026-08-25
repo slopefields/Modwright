@@ -20,6 +20,10 @@ class ErrorCode(StrEnum):
     INVALID_INSTALL_ROOT = "invalid_install_root"
     #: No mod project (or no ModWright config) at the given path.
     PROJECT_NOT_FOUND = "project_not_found"
+    #: The project exists but has never been pointed at anything on THIS
+    #: machine. Normal for a freshly cloned mod repo: the paths are local and
+    #: deliberately not committed, so they have to be supplied once.
+    PROJECT_NOT_CONFIGURED = "project_not_configured"
     #: Scaffolding would overwrite a project that is already there.
     PROJECT_EXISTS = "project_exists"
     #: Mod name is not usable as a C# assembly name and namespace.
@@ -84,6 +88,10 @@ class InvalidInstallRootError(ModwrightError):
 
 class ProjectNotFoundError(ModwrightError):
     code = ErrorCode.PROJECT_NOT_FOUND
+
+
+class ProjectNotConfiguredError(ModwrightError):
+    code = ErrorCode.PROJECT_NOT_CONFIGURED
 
 
 class ProjectExistsError(ModwrightError):

@@ -40,10 +40,32 @@ def detect_framework(install_root: Path | str) -> GameContext:
         if context is not None:
             return context
 
+    # Nothing in the game folder identifies a framework -- but a mod manager
+    # keeps each profile as a standalone loader tree elsewhere on disk, and
+    # the game folder of someone who has only ever used a manager can be
+    # completely untouched. A profile for this game is proof enough of which
+    # framework it uses.
+    #
+    # Imported here rather than at module scope: profile discovery asks the
+    # adapters what a loader tree looks like, so importing it above would
+    # close a cycle back onto this module.
+    from modwright.profiles import discover_profiles
+
+    for profile in discover_profiles(root.name):
+        adapter = get_adapter(profile.framework_id)
+        context = adapter.inspect_game(root)
+        if context is not None:
+            # Proof of framework, NOT a choice of destination. Several
+            # profiles may exist and picking one is the user's call -- see
+            # `_require_chosen_target`, which asks.
+            return context
+
     raise UnsupportedGameError(
         f"No supported modding framework detected at {root}.",
         hints=[
             "ModWright v1 supports BepInEx 5 (Mono Unity games).",
             "Confirm the game is installed and its mod loader has been set up.",
+            "If mods are run through a manager (r2modman, Thunderstore Mod "
+            "Manager, Gale), make sure a profile for this game exists in it.",
         ],
     )

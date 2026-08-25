@@ -52,8 +52,24 @@ class ModFrameworkAdapter(Protocol):
     #: pick a target they cannot use.
     supports_deploy_target: bool
 
+    def inspect_game(self, install_root: Path) -> GameContext | None:
+        """Return a context if this is a game this framework could mod.
+
+        Answers only "is this the right kind of game", never "where do mods
+        go" -- so `mods_dir` comes back unset. Split out from `detect` because
+        the loader is frequently NOT in the game folder: a mod manager keeps
+        it in a profile elsewhere, leaving the install untouched. Detection
+        that demanded a loader beside the game refused those users outright.
+        """
+        ...
+
     def detect(self, install_root: Path) -> GameContext | None:
         """Return a context if this adapter handles the install, else None.
+
+        The right kind of game is not sufficient on its own -- RimWorld is
+        Unity+Mono and loads mods natively -- so this also requires evidence
+        of the framework itself, whether that is a loader tree in the game
+        folder or a sign the game is launched against one elsewhere.
 
         Must not raise for a merely-unrecognised install -- returning None lets
         the registry try the next adapter. Raise only for a positively wrong
@@ -112,17 +128,28 @@ class ModFrameworkAdapter(Protocol):
         """
         ...
 
-    def write_mod_references(
+    def write_project_props(
         self,
         project_path: Path,
         game_context: GameContext,
         packages: list[str],
     ) -> Path:
-        """Rewrite the project's references to other installed mods.
+        """Rewrite the generated file holding this project's build inputs.
 
-        Takes the full set rather than one to add, so the generated output is
-        a function of the config alone -- no accumulated drift between what
+        Covers everything ModWright owns and must keep correct: where the game
+        is, where the LOADER is, and the references to other installed mods.
+        All of those change -- switching deploy target moves the loader -- so
+        none may live in the project file, which is written once at scaffold
+        time and never rewritten.
+
+        Takes the full set of packages rather than one to add, so the output
+        is a function of the config alone -- no accumulated drift between what
         the config says and what the project file happens to contain.
+
+        Callers must resolve the deploy target first: `game_context.mods_dir`
+        being None means the loader location is still unknown, and guessing it
+        is what silently produced projects that compiled against the wrong
+        BepInEx.
         """
         ...
 

@@ -17,7 +17,7 @@ import pytest
 
 from modwright import server
 from modwright.adapters import detect_framework
-from modwright.adapters.bepinex5 import REFERENCES_FILENAME, BepInEx5Adapter
+from modwright.adapters.bepinex5 import PROPS_FILENAME, BepInEx5Adapter
 from modwright.errors import BuildFailedError
 from modwright.models import BuildOutcome
 from modwright.mods import find_installed_mod, list_installed_mods, read_installed_mod
@@ -176,11 +176,11 @@ class TestGeneratedReferenceFile:
         path, context = project
         installed_mod(context.mods_dir, "a-Lib", {"Lib/Lib.dll": "managed"})
 
-        BepInEx5Adapter().write_mod_references(path, context, ["a-Lib"])
+        BepInEx5Adapter().write_project_props(path, context, ["a-Lib"])
 
-        assert (path / REFERENCES_FILENAME).exists()
+        assert (path / PROPS_FILENAME).exists()
         csproj = (path / "MyMod.csproj").read_text(encoding="utf-8")
-        assert REFERENCES_FILENAME in csproj
+        assert PROPS_FILENAME in csproj
 
     def test_references_are_relative_to_an_overridable_property(
         self, project, installed_mod
@@ -189,8 +189,8 @@ class TestGeneratedReferenceFile:
         path, context = project
         installed_mod(context.mods_dir, "a-Lib", {"Lib/Lib.dll": "managed"})
 
-        BepInEx5Adapter().write_mod_references(path, context, ["a-Lib"])
-        props = (path / REFERENCES_FILENAME).read_text(encoding="utf-8")
+        BepInEx5Adapter().write_project_props(path, context, ["a-Lib"])
+        props = (path / PROPS_FILENAME).read_text(encoding="utf-8")
 
         assert "<ModsDir Condition=" in props
         assert "$(ModsDir)" in props
@@ -202,8 +202,8 @@ class TestGeneratedReferenceFile:
         path, context = project
         installed_mod(context.mods_dir, "a-Lib", {"Lib.dll": "managed"})
 
-        BepInEx5Adapter().write_mod_references(path, context, ["a-Lib"])
-        props = (path / REFERENCES_FILENAME).read_text(encoding="utf-8")
+        BepInEx5Adapter().write_project_props(path, context, ["a-Lib"])
+        props = (path / PROPS_FILENAME).read_text(encoding="utf-8")
 
         for line in props.splitlines():
             if "<Reference Include=" in line:
@@ -217,30 +217,35 @@ class TestGeneratedReferenceFile:
         installed_mod(context.mods_dir, "a-Two", {"Two.dll": "managed"})
         adapter = BepInEx5Adapter()
 
-        adapter.write_mod_references(path, context, ["a-One"])
-        adapter.write_mod_references(path, context, ["a-Two"])
-        props = (path / REFERENCES_FILENAME).read_text(encoding="utf-8")
+        adapter.write_project_props(path, context, ["a-One"])
+        adapter.write_project_props(path, context, ["a-Two"])
+        props = (path / PROPS_FILENAME).read_text(encoding="utf-8")
 
         assert "Two.dll" in props
         assert "One.dll" not in props
 
-    def test_removing_the_last_reference_deletes_the_file(self, project, installed_mod):
+    def test_removing_the_last_reference_keeps_the_file(self, project, installed_mod):
+        """It also carries the build paths, so deleting it when the last
+        reference goes would break the build rather than merely drop a
+        dependency."""
         path, context = project
         installed_mod(context.mods_dir, "a-Lib", {"Lib.dll": "managed"})
         adapter = BepInEx5Adapter()
 
-        adapter.write_mod_references(path, context, ["a-Lib"])
-        adapter.write_mod_references(path, context, [])
+        adapter.write_project_props(path, context, ["a-Lib"])
+        adapter.write_project_props(path, context, [])
 
-        assert not (path / REFERENCES_FILENAME).exists()
+        props = (path / PROPS_FILENAME).read_text(encoding="utf-8")
+        assert "a-Lib" not in props
+        assert "<GameDir" in props
 
     def test_import_is_not_duplicated(self, project, installed_mod):
         path, context = project
         installed_mod(context.mods_dir, "a-Lib", {"Lib.dll": "managed"})
         adapter = BepInEx5Adapter()
 
-        adapter.write_mod_references(path, context, ["a-Lib"])
-        adapter.write_mod_references(path, context, ["a-Lib"])
+        adapter.write_project_props(path, context, ["a-Lib"])
+        adapter.write_project_props(path, context, ["a-Lib"])
 
         csproj = (path / "MyMod.csproj").read_text(encoding="utf-8")
         assert csproj.count("<Import Project=") == 1
@@ -304,7 +309,8 @@ class TestTools:
 
         assert result["references"] == []
         assert ProjectConfig.load(path).references == []
-        assert not (path / REFERENCES_FILENAME).exists()
+        # The file stays: it holds the build paths as well as the references.
+        assert "a-Lib" not in (path / PROPS_FILENAME).read_text(encoding="utf-8")
 
     def test_removing_something_not_referenced_refuses(self, project):
         path, _ = project

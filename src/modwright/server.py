@@ -90,7 +90,9 @@ def _isoformat(path: Path) -> str | None:
         return None
 
 
-def _require_chosen_target(adapter: Any, config: ProjectConfig) -> None:
+def _require_chosen_target(
+    context: GameContext, adapter: Any, config: ProjectConfig
+) -> None:
     """Refuse to guess a destination when the user has a real choice.
 
     Silence is the dangerous answer here. If the player runs this game through
@@ -103,6 +105,22 @@ def _require_chosen_target(adapter: Any, config: ProjectConfig) -> None:
         return
     profiles = discover_profiles(config.game_name)
     if not profiles:
+        if context.mods_dir is None:
+            # The game is launched through a loader that lives outside the
+            # install, and no profile for it could be found -- an unfamiliar
+            # manager, or a tree assembled by hand. The path cannot be
+            # guessed, but it can be asked for.
+            raise DeployTargetUnsetError(
+                f"{config.game_name} is launched through a mod loader that is "
+                "not inside the game folder, and none could be found "
+                "automatically.",
+                hints=[
+                    "Ask the user where their loader lives, then pass that "
+                    "path to set_deploy_target.",
+                    "For a mod manager, this is the profile folder -- the one "
+                    "containing BepInEx/.",
+                ],
+            )
         return  # No manager involved; the game folder is the only option.
 
     raise DeployTargetUnsetError(
@@ -455,6 +473,13 @@ def set_deploy_target(project_path: str, deploy_root: str | None) -> dict[str, A
         config.deploy_root = str(context.loader_root)
     else:
         config.deploy_root = None
+
+    # Regenerate BEFORE persisting. The loader moving means what the project
+    # COMPILES against moves with it, and this step can legitimately fail --
+    # the new target may not have a referenced mod installed. Saving first
+    # would leave the config pointing somewhere the generated build file does
+    # not, which is worse than not switching at all.
+    _regenerate_props(project, context, adapter, config)
     config.save(project)
 
     return {
@@ -462,6 +487,55 @@ def set_deploy_target(project_path: str, deploy_root: str | None) -> dict[str, A
         "deploy_root": config.deploy_root,
         "mods_dir": str(context.mods_dir) if context.mods_dir else None,
     }
+
+
+@mcp.tool()
+@_tool
+def set_game_install(project_path: str, install_root: str) -> dict[str, Any]:
+    """Point a project at the game install on THIS machine.
+
+    Needed in two situations: a mod project cloned from someone else, whose
+    paths were never committed, and a game that has been moved or reinstalled
+    somewhere else. Everything else about the project -- its dependencies, its
+    code -- is unaffected.
+    """
+    project = Path(project_path)
+    config = ProjectConfig.load_shared(project)
+    adapter = get_adapter(config.framework_id)
+
+    # Validate by detecting against it, so a wrong path is refused now rather
+    # than surfacing later as a confusing build error.
+    context = detect_framework(install_root)
+    config.install_root = str(context.install_root)
+    if config.deploy_root:
+        context = adapter.adopt_loader_root(context, Path(config.deploy_root))
+    # Same ordering rule as set_deploy_target: nothing is persisted until the
+    # generated build file has been written successfully.
+    _regenerate_props(project, context, adapter, config)
+    config.save(project)
+
+    return {
+        "success": True,
+        "install_root": config.install_root,
+        "game_name": context.game_name,
+        "deploy_root": config.deploy_root,
+        "mods_dir": str(context.mods_dir) if context.mods_dir else None,
+        "configured": context.mods_dir is not None,
+    }
+
+
+def _regenerate_props(
+    project: Path, context: GameContext, adapter: Any, config: ProjectConfig
+) -> None:
+    """Rewrite the generated build file after a path changed.
+
+    Skipped when the deploy target is still unknown: the file needs a mods
+    directory, and inventing one is exactly what must not happen. The build
+    then fails loudly saying the project is unconfigured, which is true.
+    """
+    if context.mods_dir is None:
+        return
+    adapter.write_project_props(project, context, [r.package for r in config.references])
 
 
 @mcp.tool()
@@ -540,7 +614,7 @@ def add_mod_reference(project_path: str, package: str) -> dict[str, Any]:
 
     packages = [r.package for r in config.references if r.package != mod.package]
     packages.append(mod.package)
-    adapter.write_mod_references(project, context, packages)
+    adapter.write_project_props(project, context, packages)
 
     config.references = [r for r in config.references if r.package != mod.package]
     config.references.append(
@@ -583,7 +657,7 @@ def remove_mod_reference(project_path: str, package: str) -> dict[str, Any]:
             else ["This project references no other mods."],
         )
 
-    adapter.write_mod_references(project, context, [r.package for r in remaining])
+    adapter.write_project_props(project, context, [r.package for r in remaining])
     config.references = remaining
     config.save(project)
     return {
@@ -601,7 +675,7 @@ def deploy_mod(project_path: str) -> dict[str, Any]:
     when one is set, otherwise the game install.
     """
     context, adapter, config = _context_for_project(Path(project_path))
-    _require_chosen_target(adapter, config)
+    _require_chosen_target(context, adapter, config)
     outcome = adapter.build(Path(project_path))
     deployed = adapter.deploy(outcome, context)
     return {
