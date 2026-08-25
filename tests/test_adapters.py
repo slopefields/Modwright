@@ -9,6 +9,8 @@ from __future__ import annotations
 import pytest
 
 from modwright.adapters import detect_framework
+from modwright.adapters.base import ModFrameworkAdapter
+from modwright.adapters.registry import ADAPTERS, _protocol_members, _verify_adapters
 from modwright.adapters.bepinex5 import BepInEx5Adapter
 from modwright.errors import (
     Il2CppUnsupportedError,
@@ -152,3 +154,46 @@ class TestLoaderOutsideTheGameFolder:
         game = fake_game("CoolGame")
         context = BepInEx5Adapter().detect(game)
         assert context.mods_dir == game / "BepInEx" / "plugins"
+
+
+class TestTheContractIsEnforced:
+    """`ModFrameworkAdapter` is a Protocol, which Python checks only under a
+    type checker -- and this project runs none. Adapters do not even inherit
+    from it. So adding a member to the contract would silently invalidate
+    every adapter written before it, and the first sign would be an
+    AttributeError inside whichever tool called the missing member.
+    """
+
+    def test_every_registered_adapter_satisfies_it(self):
+        for adapter in ADAPTERS:
+            assert isinstance(adapter, ModFrameworkAdapter), (
+                f"{type(adapter).__name__} does not implement the contract"
+            )
+
+    def test_an_incomplete_adapter_is_refused_by_name(self):
+        """What a future adapter looks like when the contract has moved on
+        without it: everything common is present, one newer member is not."""
+
+        class StaleAdapter(BepInEx5Adapter):
+            framework_id = "stale"
+
+            def __getattribute__(self, name):
+                if name == "inspect_logging":
+                    raise AttributeError(name)
+                return object.__getattribute__(self, name)
+
+        with pytest.raises(TypeError) as excinfo:
+            _verify_adapters((StaleAdapter(),))
+
+        message = str(excinfo.value)
+        assert "StaleAdapter" in message
+        assert "inspect_logging" in message
+
+    def test_the_member_list_is_read_from_the_protocol(self):
+        """Hardcoding it here would be one more list to remember to update --
+        the very problem this check exists to remove."""
+        members = _protocol_members(ModFrameworkAdapter)
+
+        assert "inspect_logging" in members  # a method
+        assert "framework_id" in members  # an annotated attribute
+        assert not any(name.startswith("_") for name in members)

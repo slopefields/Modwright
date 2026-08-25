@@ -15,6 +15,56 @@ from modwright.models import GameContext
 ADAPTERS: tuple[ModFrameworkAdapter, ...] = (BepInEx5Adapter(),)
 
 
+def _protocol_members(protocol: type) -> set[str]:
+    """Every name `protocol` requires: its methods plus its annotated fields.
+
+    Read off the Protocol itself so it cannot fall behind. A hardcoded list
+    here would be one more thing to remember to update, which is the exact
+    problem this module is trying to solve.
+    """
+    return {name for name in vars(protocol) if not name.startswith("_")} | set(
+        getattr(protocol, "__annotations__", {})
+    )
+
+
+def _verify_adapters(adapters: tuple[ModFrameworkAdapter, ...]) -> None:
+    """Refuse to start if a registered adapter is missing part of the contract.
+
+    `ModFrameworkAdapter` is a Protocol, which Python checks only when a type
+    checker is run -- and this project does not run one. Nothing else connects
+    an adapter to it: the adapters do not even inherit from it, since Protocols
+    match by shape. So without this, adding a member to the contract silently
+    invalidates every adapter written before it, and the first anyone hears of
+    it is an AttributeError inside whichever tool happens to call the missing
+    member. That surfaces late, far from the cause, and for
+    `inspect_logging` it would surface only while diagnosing another failure.
+
+    Checked at import so a broken registration stops the server outright,
+    rather than one tool call in some later session.
+
+    Not a substitute for a type checker: `isinstance` against a Protocol
+    confirms that members EXIST, not that their signatures match. An adapter
+    whose `write_project_props` takes the wrong arguments passes this.
+    """
+    for adapter in adapters:
+        if isinstance(adapter, ModFrameworkAdapter):
+            continue
+        missing = sorted(
+            name
+            for name in _protocol_members(ModFrameworkAdapter)
+            if not hasattr(adapter, name)
+        )
+        raise TypeError(
+            f"{type(adapter).__name__} is registered in ADAPTERS but does not "
+            f"implement ModFrameworkAdapter: missing {', '.join(missing)}. "
+            "Every adapter must answer the whole contract, including "
+            "answering 'not applicable' explicitly -- see adapters/base.py."
+        )
+
+
+_verify_adapters(ADAPTERS)
+
+
 def get_adapter(framework_id: str) -> ModFrameworkAdapter:
     for adapter in ADAPTERS:
         if adapter.framework_id == framework_id:
