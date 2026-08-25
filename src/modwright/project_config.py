@@ -8,12 +8,28 @@ being moved or cloned, and never desynchronise from a central index.
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
 from modwright.errors import ProjectNotFoundError
 
 CONFIG_FILENAME = ".modwright.json"
+
+
+@dataclass
+class ModReference:
+    """A mod this project compiles against.
+
+    Only the package folder name and the version *at the time it was added*
+    are stored. The version currently installed is deliberately NOT cached:
+    it is a millisecond away in the profile, and a stored copy would go stale
+    the moment the user updates the mod, leaving two disagreeing answers to
+    the same question. What cannot be recovered later is what the version was
+    when the code was written against it -- so that is what gets recorded.
+    """
+
+    package: str
+    version_when_added: str | None = None
 
 
 @dataclass
@@ -26,6 +42,8 @@ class ProjectConfig:
     #: manager profile. Optional and defaulted so configs written before this
     #: existed still load.
     deploy_root: str | None = None
+    #: Other mods this project compiles against.
+    references: list[ModReference] = field(default_factory=list)
 
     def save(self, project_path: Path) -> Path:
         path = project_path / CONFIG_FILENAME
@@ -44,4 +62,12 @@ class ProjectConfig:
         # Ignore unknown keys rather than crashing: a project written by a
         # newer ModWright should still open in an older one.
         known = {f.name for f in fields(cls)}
-        return cls(**{k: v for k, v in data.items() if k in known})
+        kwargs = {k: v for k, v in data.items() if k in known}
+        kwargs["references"] = [
+            ModReference(**{
+                k: v for k, v in entry.items()
+                if k in {f.name for f in fields(ModReference)}
+            })
+            for entry in kwargs.get("references") or []
+        ]
+        return cls(**kwargs)

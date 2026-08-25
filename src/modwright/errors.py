@@ -33,6 +33,8 @@ class ErrorCode(StrEnum):
     #: More than one place this mod could be installed, and none was chosen.
     #: Not a failure to be retried -- the user has to pick.
     DEPLOY_TARGET_UNSET = "deploy_target_unset"
+    #: A referenced mod is not installed where the project deploys.
+    MOD_REFERENCE_NOT_FOUND = "mod_reference_not_found"
     #: The framework's log file does not exist yet (game never run since install).
     LOG_NOT_FOUND = "log_not_found"
     #: DecompilerServer could not be reached or returned an error.
@@ -106,6 +108,10 @@ class InvalidDeployRootError(ModwrightError):
 
 class DeployTargetUnsetError(ModwrightError):
     code = ErrorCode.DEPLOY_TARGET_UNSET
+
+
+class ModReferenceNotFoundError(ModwrightError):
+    code = ErrorCode.MOD_REFERENCE_NOT_FOUND
 
 
 class LogNotFoundError(ModwrightError):

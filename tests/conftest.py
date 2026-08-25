@@ -8,8 +8,10 @@ those are absent, so a fresh checkout still gets a meaningful test run.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
+import struct
 from pathlib import Path
 
 import pytest
@@ -142,6 +144,53 @@ def fake_profile(tmp_path: Path):
         return root
 
     return _build
+
+
+@pytest.fixture()
+def installed_mod(tmp_path: Path):
+    """Install a fake mod package into a mods directory.
+
+    `files` maps a relative path to either "managed", "native", or raw bytes,
+    so the assembly filtering can be tested without shipping real DLLs.
+    """
+
+    def _install(
+        mods_dir: Path,
+        package: str,
+        files: dict[str, str],
+        version: str | None = "1.0.0",
+    ) -> Path:
+        root = mods_dir / package
+        root.mkdir(parents=True, exist_ok=True)
+        for relative, kind in files.items():
+            target = root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(_pe_bytes(managed=kind == "managed"))
+        if version is not None:
+            (root / "manifest.json").write_text(
+                json.dumps({"name": package.split("-")[-1], "version_number": version}),
+                encoding="utf-8",
+            )
+        return root
+
+    return _install
+
+
+def _pe_bytes(*, managed: bool) -> bytes:
+    """A minimal PE32 file, with or without a CLI header directory entry.
+
+    Only the fields the managed/native check reads are filled in; everything
+    else is zero. Enough to exercise the real parser rather than a stub.
+    """
+    pe_offset = 0x80
+    data = bytearray(0x400)
+    data[0:2] = b"MZ"
+    data[0x3C:0x40] = struct.pack("<I", pe_offset)
+    data[pe_offset : pe_offset + 4] = b"PE" + bytes(2)
+    struct.pack_into("<H", data, pe_offset + 24, 0x10B)  # PE32
+    directories = pe_offset + 24 + 96
+    struct.pack_into("<I", data, directories + 14 * 8, 0x2000 if managed else 0)
+    return bytes(data)
 
 
 @pytest.fixture()

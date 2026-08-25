@@ -16,11 +16,17 @@ from typing import Any, Callable
 from mcp.server import MCPServer
 
 from modwright.adapters import detect_framework, get_adapter
-from modwright.errors import DeployTargetUnsetError, LogNotFoundError, ModwrightError
+from modwright.errors import (
+    DeployTargetUnsetError,
+    LogNotFoundError,
+    ModReferenceNotFoundError,
+    ModwrightError,
+)
 from modwright.logs import read_since
+from modwright.mods import find_installed_mod, list_installed_mods
 from modwright.models import GameContext
 from modwright.profiles import discover_profiles
-from modwright.project_config import ProjectConfig
+from modwright.project_config import ModReference, ProjectConfig
 from modwright.validation import validate_targets
 
 mcp = MCPServer("modwright")
@@ -266,15 +272,50 @@ def build_mod(project_path: str) -> dict[str, Any]:
     response says which happened so the agent knows whether a deploy is still
     needed.
     """
-    _, adapter, _ = _context_for_project(Path(project_path))
+    context, adapter, config = _context_for_project(Path(project_path))
     outcome = adapter.build(Path(project_path))
-    return {
+    response = {
         "success": True,
         "artifact": str(outcome.artifact) if outcome.artifact else None,
         "deployed_by_build": outcome.deployed_by_build,
         "deploy_required": not outcome.deployed_by_build,
         "log": outcome.log,
     }
+    drift = _reference_drift(context, config)
+    if drift:
+        response["reference_warnings"] = drift
+    return response
+
+
+def _reference_drift(context: GameContext, config: ProjectConfig) -> list[str]:
+    """Report dependencies whose installed version has moved since they were added.
+
+    Not a failure and not a pin: the project compiles against whatever is
+    installed either way. The point is that a dependency updating underneath
+    you should be something you are told, rather than something inferred later
+    from a puzzling compile error about a method that used to exist.
+    """
+    if not config.references or context.mods_dir is None:
+        return []
+
+    warnings: list[str] = []
+    for reference in config.references:
+        installed = find_installed_mod(context.mods_dir, reference.package)
+        if installed is None:
+            warnings.append(
+                f"{reference.package} is referenced but no longer installed."
+            )
+        elif (
+            reference.version_when_added
+            and installed.version
+            and installed.version != reference.version_when_added
+        ):
+            warnings.append(
+                f"{reference.package} was {reference.version_when_added} when it "
+                f"was added and is {installed.version} now; the build compiles "
+                "against the installed version."
+            )
+    return warnings
 
 
 @mcp.tool()
@@ -345,6 +386,122 @@ def set_deploy_target(project_path: str, deploy_root: str | None) -> dict[str, A
         "success": True,
         "deploy_root": config.deploy_root,
         "mods_dir": str(context.mods_dir) if context.mods_dir else None,
+    }
+
+
+@mcp.tool()
+@_tool
+def list_available_mods(project_path: str) -> dict[str, Any]:
+    """List mods installed alongside this project, available to reference.
+
+    Use before `add_mod_reference` to see what is there. A mod that builds on
+    another -- a networking library, a shared API -- compiles against the copy
+    already installed in the deploy target, so it matches the version the game
+    will actually load and nothing has to be downloaded or copied.
+    """
+    context, _, _ = _context_for_project(Path(project_path))
+    if context.mods_dir is None:
+        return {"success": True, "mods": []}
+
+    return {
+        "success": True,
+        "mods_dir": str(context.mods_dir),
+        "mods": [
+            {
+                "package": mod.package,
+                "name": mod.display_name,
+                "version": mod.version,
+                "assemblies": [a.name for a in mod.assemblies],
+                "referenceable": mod.referenceable,
+            }
+            for mod in list_installed_mods(context.mods_dir)
+        ],
+    }
+
+
+@mcp.tool()
+@_tool
+def add_mod_reference(project_path: str, package: str) -> dict[str, Any]:
+    """Compile this project against another installed mod.
+
+    `package` accepts the folder name (`xilophor-StaticNetcodeLib`) or just
+    the mod name (`StaticNetcodeLib`).
+
+    Every managed assembly the package ships is referenced, because which one
+    holds the API cannot be known from the outside -- package names and
+    assembly names often differ entirely. Unused references cost nothing: C#
+    binds only what the code actually uses. Native libraries and framework
+    assemblies are excluded, since referencing either breaks the build.
+    """
+    project = Path(project_path)
+    context, adapter, config = _context_for_project(project)
+    if context.mods_dir is None:
+        raise ModReferenceNotFoundError(
+            f"{config.game_name} has no mods directory to reference from."
+        )
+
+    mod = find_installed_mod(context.mods_dir, package)
+    if mod is None:
+        raise ModReferenceNotFoundError(
+            f"No mod matching {package!r} is installed in {context.mods_dir}.",
+            hints=[
+                "Install it through this profile's mod manager first.",
+                "list_available_mods shows what is installed.",
+            ],
+        )
+    if not mod.referenceable:
+        raise ModReferenceNotFoundError(
+            f"{mod.package} ships no assembly that can be referenced.",
+            hints=[skip.reason for skip in mod.skipped] or None,
+        )
+
+    packages = [r.package for r in config.references if r.package != mod.package]
+    packages.append(mod.package)
+    adapter.write_mod_references(project, context, packages)
+
+    config.references = [r for r in config.references if r.package != mod.package]
+    config.references.append(
+        ModReference(package=mod.package, version_when_added=mod.version)
+    )
+    config.save(project)
+
+    return {
+        "success": True,
+        "package": mod.package,
+        "version": mod.version,
+        "referenced": [str(a) for a in mod.assemblies],
+        "skipped": [
+            {"file": skip.path.name, "reason": skip.reason} for skip in mod.skipped
+        ],
+        "hints": [
+            "Declare this as a dependency when publishing, or players will "
+            "not have it installed.",
+        ],
+    }
+
+
+@mcp.tool()
+@_tool
+def remove_mod_reference(project_path: str, package: str) -> dict[str, Any]:
+    """Stop compiling this project against another mod."""
+    project = Path(project_path)
+    context, adapter, config = _context_for_project(project)
+
+    remaining = [r for r in config.references if r.package.lower() != package.lower()]
+    if len(remaining) == len(config.references):
+        raise ModReferenceNotFoundError(
+            f"{package!r} is not referenced by this project.",
+            hints=[f"Referenced: {', '.join(r.package for r in config.references)}"]
+            if config.references
+            else ["This project references no other mods."],
+        )
+
+    adapter.write_mod_references(project, context, [r.package for r in remaining])
+    config.references = remaining
+    config.save(project)
+    return {
+        "success": True,
+        "references": [r.package for r in remaining],
     }
 
 

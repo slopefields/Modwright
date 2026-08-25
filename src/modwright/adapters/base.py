@@ -111,6 +111,20 @@ class ModFrameworkAdapter(Protocol):
         """
         ...
 
+    def write_mod_references(
+        self,
+        project_path: Path,
+        game_context: GameContext,
+        packages: list[str],
+    ) -> Path:
+        """Rewrite the project's references to other installed mods.
+
+        Takes the full set rather than one to add, so the generated output is
+        a function of the config alone -- no accumulated drift between what
+        the config says and what the project file happens to contain.
+        """
+        ...
+
     def extract_patch_targets(self, mod_source_dir: Path) -> list[PatchTarget]:
         """Parse the mod's own source for the targets it claims to patch."""
         ...
