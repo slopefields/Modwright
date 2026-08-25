@@ -29,6 +29,7 @@ from modwright.models import (
     DeployOutcome,
     GameContext,
     LoaderInfo,
+    LoggingStatus,
     PatchTarget,
 )
 from modwright.mods import find_installed_mod
@@ -160,6 +161,48 @@ def _compiler_errors(build_output: str, limit: int = 15) -> list[str]:
         if "error" in line and line not in seen:
             seen.append(line)
     return seen[:limit]
+
+
+def _read_ini_flag(path: Path, section: str, key: str) -> bool | None:
+    """Read one boolean out of an ini-shaped config file.
+
+    Returns None -- never a guess -- when the file, section, key, or value
+    cannot be read, so a caller can tell "positively off" from "no idea".
+
+    Hand-rolled rather than `configparser` because this runs inside a failure
+    diagnosis, where anything that raises replaces a confusing answer with no
+    answer at all. BepInEx.cfg is ini-*ish*, not ini, and configparser's
+    defaults are hostile to it: a `%` anywhere in a value trips string
+    interpolation, and a repeated key trips strict mode. Using it safely would
+    mean disabling both and still wrapping the call in a blanket `except` --
+    more machinery than reading the single key we actually want, and a bare
+    except would swallow real bugs along with the malformed configs.
+    """
+    try:
+        # utf-8-sig so a byte-order mark cannot glue itself to the first
+        # section header and make it never match.
+        text = path.read_text(encoding="utf-8-sig", errors="replace")
+    except OSError:
+        return None
+
+    wanted = f"[{section}]"
+    in_section = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("["):
+            in_section = line == wanted
+        elif in_section and "=" in line and not line.startswith("#"):
+            name, _, value = line.partition("=")
+            if name.strip() != key:
+                continue
+            match value.strip().lower():
+                case "true":
+                    return True
+                case "false":
+                    return False
+                case _:
+                    return None  # Present but unreadable: claim nothing.
+    return None
 
 
 class BepInEx5Adapter:
@@ -548,3 +591,24 @@ class BepInEx5Adapter:
         root = game_context.effective_loader_root
         log_path = root / "BepInEx" / "LogOutput.log"
         return log_path if log_path.exists() else None
+
+    def inspect_logging(self, loader_root: Path) -> LoggingStatus:
+        config_path = loader_root / "BepInEx" / "config" / "BepInEx.cfg"
+        if not config_path.is_file():
+            # BepInEx writes this file on its first run, so its absence is a
+            # sign the loader has never started here. Only a sign, though:
+            # an imported profile arrives with configs it never wrote.
+            return LoggingStatus(disabled=False, config_path=None)
+
+        if _read_ini_flag(config_path, "Logging.Disk", "Enabled") is False:
+            return LoggingStatus(
+                disabled=True,
+                config_path=config_path,
+                hint=(
+                    f"Disk logging is turned off for this loader: "
+                    f"[Logging.Disk] Enabled = false in {config_path}. "
+                    "BepInEx writes no log file at all in that state, however "
+                    "well the mod is running. Set it to true and relaunch."
+                ),
+            )
+        return LoggingStatus(disabled=False, config_path=config_path)

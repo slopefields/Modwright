@@ -10,12 +10,14 @@ matching on message text.
 from __future__ import annotations
 
 import functools
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
 from mcp.server import MCPServer
 
 from modwright.adapters import detect_framework, get_adapter
+from modwright.diagnosis import diagnose_empty_log
 from modwright.errors import (
     DeployTargetUnsetError,
     LogNotFoundError,
@@ -75,6 +77,16 @@ def _context_for_project(project_path: Path) -> tuple[GameContext, Any, ProjectC
     if config.deploy_root:
         context = adapter.adopt_loader_root(context, Path(config.deploy_root))
     return context, adapter, config
+
+
+def _isoformat(path: Path) -> str | None:
+    """When a file was last written, or None if it cannot be read."""
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime).isoformat(
+            timespec="seconds"
+        )
+    except OSError:
+        return None
 
 
 def _require_chosen_target(adapter: Any, config: ProjectConfig) -> None:
@@ -535,22 +547,44 @@ def watch_mod_logs(
     Poll-on-demand: call once after deploying, then again with the returned
     cursor while reproducing an issue in-game. An MCP server cannot push
     updates, so the agent drives the loop.
+
+    When nothing comes back, a `diagnosis` explains the silence -- most often
+    that the game was launched through a different loader than the one this
+    mod deploys into, which otherwise fails completely silently. Its `reason`
+    reports what was observed, not what caused it: ask the user before acting
+    on it, since the likeliest fixes are opposites.
     """
     context, adapter, _ = _context_for_project(Path(project_path))
     log_path = adapter.resolve_log(context)
     if log_path is None:
+        # No log at all is the strongest form of "nothing was written here",
+        # so it gets the same diagnosis rather than a flat instruction to run
+        # the game -- which is actively misleading when the user did run it,
+        # just through a different loader.
         raise LogNotFoundError(
             f"No log file found for {context.game_name}.",
             hints=["Run the game at least once with the mod loader installed."],
+            details={"diagnosis": diagnose_empty_log(context, adapter, None)},
         )
 
     read = read_since(log_path, since_cursor=since_cursor, lines=lines)
-    return {
+    response = {
         "success": True,
         "log_path": str(read.path),
         "cursor": read.cursor,
         "content": read.content,
+        # On every read, not just empty ones. The first poll of a session
+        # returns the tail of whatever is already there, which can be weeks
+        # old -- content alone gives no way to tell that apart from a live
+        # session, and it costs one stat to say so.
+        "log_written_at": _isoformat(log_path),
     }
+    if not read.content:
+        # Only when there is silence to explain. Content in the log proves
+        # this loader ran, which makes the whole diagnosis unnecessary -- and
+        # this is the one tool an agent polls in a loop.
+        response["diagnosis"] = diagnose_empty_log(context, adapter, log_path)
+    return response
 
 
 def main() -> None:

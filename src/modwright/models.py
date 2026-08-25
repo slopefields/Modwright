@@ -63,6 +63,30 @@ class LoaderInfo:
 
 
 @dataclass(frozen=True)
+class LoggingStatus:
+    """Whether a loader tree is configured to write a log at all.
+
+    Every loader can be told not to, and one that has been is
+    indistinguishable from one that never ran -- so an empty log means
+    nothing until this has been checked.
+
+    `disabled` is deliberately a plain bool rather than a tri-state: it is
+    True only when the setting was positively read as off. A missing or
+    unreadable config leaves it False, because loaders default to logging on,
+    so "no config" behaves like "on" and must never be reported as off.
+    `config_path` being None is what carries "nothing has written a config
+    here yet" -- useful as evidence, too weak to conclude from.
+    """
+
+    disabled: bool
+    #: The file the setting was read from, or None if there is no config yet.
+    config_path: Path | None = None
+    #: The adapter's own wording for how to turn logging back on. Framework-
+    #: specific -- naming this file is the adapter's job, never the server's.
+    hint: str | None = None
+
+
+@dataclass(frozen=True)
 class BuildOutcome:
     """Result of an adapter's build step.
 

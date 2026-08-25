@@ -130,6 +130,7 @@ def fake_profile(tmp_path: Path):
         core: bool = True,
         plugins: bool = True,
         log: bool = False,
+        disk_logging: bool | None = None,
     ) -> Path:
         root = tmp_path / manager / game_folder / "profiles" / name
         loader = root / "BepInEx"
@@ -140,10 +141,54 @@ def fake_profile(tmp_path: Path):
             (loader / "plugins").mkdir(exist_ok=True)
         if log:
             (loader / "LogOutput.log").write_text("start\n", encoding="utf-8")
+        if disk_logging is not None:
+            # None leaves no config at all, which is the state of a profile
+            # BepInEx has never started in.
+            write_bepinex_config(root, disk_logging=disk_logging)
         (root / "doorstop_config.ini").write_text("enabled = true\n", encoding="utf-8")
         return root
 
     return _build
+
+
+def write_bepinex_config(loader_root: Path, *, disk_logging: bool) -> Path:
+    """Write a BepInEx.cfg shaped like a real one.
+
+    Deliberately not a two-line stub: the real file surrounds the key with
+    `##` doc comments, `#` metadata lines and other sections, and a decoy
+    `Enabled` in a different section. Parsing that is the actual job.
+    """
+    path = loader_root / "BepInEx" / "config" / "BepInEx.cfg"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "[Caching]\n"
+        "\n"
+        "## Enable/disable assembly metadata cache.\n"
+        "# Setting type: Boolean\n"
+        "# Default value: true\n"
+        "EnableAssemblyCache = true\n"
+        "\n"
+        "[Logging.Console]\n"
+        "\n"
+        "## Enables showing a console for log output.\n"
+        "# Setting type: Boolean\n"
+        "# Default value: false\n"
+        "Enabled = false\n"
+        "\n"
+        "[Logging.Disk]\n"
+        "\n"
+        "## Include unity log messages in log file output.\n"
+        "# Setting type: Boolean\n"
+        "# Default value: false\n"
+        "WriteUnityLog = true\n"
+        "\n"
+        "## Enables writing log messages to disk.\n"
+        "# Setting type: Boolean\n"
+        "# Default value: true\n"
+        f"Enabled = {'true' if disk_logging else 'false'}\n",
+        encoding="utf-8",
+    )
+    return path
 
 
 @pytest.fixture()

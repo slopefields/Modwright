@@ -29,6 +29,7 @@ from modwright.models import (
     DeployOutcome,
     GameContext,
     LoaderInfo,
+    LoggingStatus,
     PatchTarget,
 )
 
@@ -131,4 +132,20 @@ class ModFrameworkAdapter(Protocol):
 
     def resolve_log(self, game_context: GameContext) -> Path | None:
         """Return the log file to read now, or None if none exists yet."""
+        ...
+
+    def inspect_logging(self, loader_root: Path) -> LoggingStatus:
+        """Report whether this loader tree would write a log if it ran.
+
+        Reading an empty log as "the game never ran here" is only sound once
+        this has been checked: a loader told not to log looks exactly the
+        same. The adapter supplies both the check and the wording, because
+        every framework keeps this setting in its own file under its own name
+        -- putting that prose in the server would leak one framework's
+        vocabulary into the layer that is supposed to have none.
+
+        Must not raise. This runs while diagnosing a failure, so an exception
+        here replaces a confusing answer with no answer at all; an unreadable
+        config is reported as "not known to be off".
+        """
         ...

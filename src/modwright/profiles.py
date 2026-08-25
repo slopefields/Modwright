@@ -57,9 +57,21 @@ class ModProfile:
     #: The loader log inside this profile, when it has been written at least
     #: once. Its absence just means the profile has never been launched.
     log_path: Path | None
-    #: Number of installed mods, as a rough "is this a busy profile" signal.
-    #: A thin profile makes log output readable and failures attributable.
-    mod_count: int
+    #: Where this profile keeps its installed mods.
+    mods_dir: Path
+
+    @property
+    def mod_count(self) -> int:
+        """Installed mods, as a rough "is this a busy profile" signal.
+
+        A thin profile makes log output readable and failures attributable.
+
+        Computed on access rather than at construction because only the two
+        human-facing profile listings ever read it, while discovery itself now
+        runs on the log-polling path -- counting several hundred directory
+        entries per profile to answer a question nobody asked.
+        """
+        return len(list(self.mods_dir.iterdir())) if self.mods_dir.is_dir() else 0
 
 
 def manager_data_dirs() -> list[Path]:
@@ -98,7 +110,6 @@ def _read_profile(manager: str, game_folder: str, path: Path) -> ModProfile | No
         info = adapter.inspect_loader_root(path)
         if info is None:
             continue  # Not this adapter's shape; try the next.
-        mods = info.mods_dir
         return ModProfile(
             manager=manager,
             game_folder=game_folder,
@@ -106,7 +117,7 @@ def _read_profile(manager: str, game_folder: str, path: Path) -> ModProfile | No
             path=path,
             framework_id=adapter.framework_id,
             log_path=info.log_path,
-            mod_count=len(list(mods.iterdir())) if mods.is_dir() else 0,
+            mods_dir=info.mods_dir,
         )
     return None  # No adapter can deploy here, so it is not worth offering.
 
