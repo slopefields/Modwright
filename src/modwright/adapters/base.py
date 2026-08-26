@@ -92,6 +92,24 @@ class ModFrameworkAdapter(Protocol):
         """
         ...
 
+    def explain_unusable_loader_root(self, loader_root: Path) -> str | None:
+        """Say why a tree that was MEANT to be a loader is not one yet.
+
+        Called only for directories the caller already knows were meant to
+        hold a loader -- a mod manager's own profile folder -- so it does not
+        have to establish intent, only report what is missing. Returns None
+        when this framework has nothing to say about the tree, either because
+        it is usable or because it is another framework's shape entirely.
+
+        Exists because dropping such a profile from a listing silently is
+        worse than refusing it out loud: the one profile a user just created
+        and named is the one missing from the list, which reads as the tool
+        being wrong rather than the profile being empty. The wording lives
+        here because naming what to install -- a package, in the manager's own
+        vocabulary -- is framework knowledge the listing must not carry.
+        """
+        ...
+
     def adopt_loader_root(
         self, game_context: GameContext, loader_root: Path
     ) -> GameContext:

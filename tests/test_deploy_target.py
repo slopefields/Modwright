@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import pytest
 
+from modwright import server
 from modwright.adapters import detect_framework
 from modwright.adapters.bepinex5 import BepInEx5Adapter
 from modwright.errors import InvalidDeployRootError
@@ -309,3 +310,96 @@ class TestDiscoveryDefersToAdapters:
             lambda: [tmp_path / "r2modmanPlus-local"],
         )
         assert discover_profiles() == []
+
+
+class TestProfilesWithNoLoaderYet:
+    """Accounting for the profiles `discover_profiles` deliberately drops.
+
+    A manager creates the profile entry immediately but does not install the
+    loader until something is installed into it, so a profile the user just
+    made and named holds nothing. Refusing it as a deploy target is right --
+    a file put there would load nothing. Omitting it from the listing without
+    a word is not: the one name the user is looking for is the one missing,
+    which reads as the tool being out of date rather than the profile being
+    empty, and that is what it cost in the rehearsal.
+    """
+
+    @pytest.fixture()
+    def listing(self, fake_profile, monkeypatch, tmp_path):
+        def _build(*bare_names, **kwargs):
+            fake_profile("ready", game_folder="LethalCompany", **kwargs)
+            root = tmp_path / "r2modmanPlus-local"
+            for name in bare_names:
+                (root / "LethalCompany" / "profiles" / name).mkdir(parents=True)
+            monkeypatch.setattr(
+                "modwright.profiles.manager_data_dirs", lambda: [root]
+            )
+
+        return _build
+
+    def test_an_empty_profile_is_reported_rather_than_dropped(self, listing):
+        listing("brand new")
+        result = server.list_mod_profiles("Lethal Company")
+
+        assert [p["name"] for p in result["profiles"]] == ["ready"]
+        assert [p["name"] for p in result["unavailable"]] == ["brand new"]
+
+    def test_the_reason_names_the_package_to_install(self, listing):
+        """The listing itself must not know the word: it comes from whichever
+        adapter recognised the shape."""
+        listing("brand new")
+        entry = server.list_mod_profiles("Lethal Company")["unavailable"][0]
+
+        assert "BepInExPack" in entry["reason"]
+
+    def test_a_shell_with_no_loader_in_it_is_reported_too(
+        self, listing, fake_profile
+    ):
+        """Not the same as empty: this one has the folder but not the loader,
+        and would accept a deployed file and load nothing."""
+        fake_profile("hollow", game_folder="LethalCompany", core=False)
+        listing()
+        entry = next(
+            p
+            for p in server.list_mod_profiles("Lethal Company")["unavailable"]
+            if p["name"] == "hollow"
+        )
+
+        assert "core" in entry["reason"]
+
+    def test_the_two_listings_together_cover_every_directory(self, listing):
+        """Neither list may quietly swallow a profile."""
+        listing("one", "two")
+        result = server.list_mod_profiles("Lethal Company")
+
+        names = {p["name"] for p in result["profiles"]}
+        names |= {p["name"] for p in result["unavailable"]}
+        assert names == {"ready", "one", "two"}
+
+    def test_usable_profiles_are_never_listed_as_unavailable(self, listing):
+        listing()
+        result = server.list_mod_profiles("Lethal Company")
+
+        assert result["unavailable"] == []
+
+    def test_only_empty_profiles_is_not_reported_as_no_profiles(
+        self, monkeypatch, tmp_path
+    ):
+        """The old empty-list hint said no manager was installed, which sends
+        a user whose only profile is a new one after the wrong problem."""
+        root = tmp_path / "r2modmanPlus-local"
+        (root / "LethalCompany" / "profiles" / "brand new").mkdir(parents=True)
+        monkeypatch.setattr("modwright.profiles.manager_data_dirs", lambda: [root])
+
+        result = server.list_mod_profiles("Lethal Company")
+
+        assert result["profiles"] == []
+        assert [p["name"] for p in result["unavailable"]] == ["brand new"]
+        assert not any("No mod-manager profiles" in h for h in result["hints"])
+
+    def test_no_manager_at_all_still_says_so(self, monkeypatch):
+        monkeypatch.setattr("modwright.profiles.manager_data_dirs", lambda: [])
+        result = server.list_mod_profiles("Lethal Company")
+
+        assert result["unavailable"] == []
+        assert any("No mod-manager profiles" in h for h in result["hints"])

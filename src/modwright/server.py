@@ -28,7 +28,7 @@ from modwright.errors import (
 from modwright.logs import read_since
 from modwright.mods import find_installed_mod, list_installed_mods
 from modwright.models import GameContext
-from modwright.profiles import discover_profiles
+from modwright.profiles import discover_incomplete_profiles, discover_profiles
 from modwright.project_config import ModReference, ProjectConfig
 from modwright.validation import validate_targets
 
@@ -114,8 +114,11 @@ def _require_chosen_target(
                 hints=[
                     "Ask the user where their loader lives, then pass that "
                     "path to set_deploy_target.",
+                    # Named from the adapter rather than written in here. Just
+                    # as concrete as hardcoding the loader, and it stays true
+                    # for the next framework instead of quietly becoming a lie.
                     "For a mod manager, this is the profile folder -- the one "
-                    "containing BepInEx/.",
+                    f"holding the {adapter.display_name} tree.",
                 ],
             )
         return  # No manager involved; the game folder is the only option.
@@ -130,11 +133,17 @@ def _require_chosen_target(
             "player launches the same profile it was deployed into.",
             "To install into the game folder itself, pass that path to "
             "set_deploy_target explicitly.",
+            # Deliberately does not name the loader package: which one it is "
+            # is the adapter's knowledge, and list_mod_profiles reports it
+            # per-profile in the framework's own words.
             "A fresh profile is often the better answer than reusing a busy "
-            "one: create it in the mod manager, then install the BepInEx pack "
-            "into it (installing any mod pulls it in). ModWright does not "
-            "create profiles -- the manager keeps its own records, and a "
-            "folder made behind its back would not match them.",
+            "one: create it in the mod manager, then install the loader into "
+            "it -- list_mod_profiles names the package to install. Installing "
+            "a gameplay mod also pulls the loader in, but brings that mod and "
+            "its dependencies along, which is how a test profile ends up "
+            "crowded. ModWright does not create profiles -- the manager keeps "
+            "its own records, and a folder made behind its back would not "
+            "match them.",
         ],
         details={
             "profiles": [
@@ -415,10 +424,26 @@ def list_mod_profiles(game_name: str | None = None) -> dict[str, Any]:
 
     Returns an empty list rather than failing when no manager is installed --
     that just means mods load from the game folder, which is the default.
+
+    `unavailable` holds profiles that exist but have no loader in them yet,
+    each with the reason. They cannot be deployed into, but a user who has
+    just created one will ask for it by name, and each entry says what to
+    install to make it usable.
     """
     profiles = discover_profiles(game_name)
+    incomplete = discover_incomplete_profiles(game_name)
     return {
         "success": True,
+        "unavailable": [
+            {
+                "manager": p.manager,
+                "game": p.game_folder,
+                "name": p.name,
+                "path": str(p.path),
+                "reason": p.reason,
+            }
+            for p in incomplete
+        ],
         "profiles": [
             {
                 "manager": p.manager,
@@ -431,19 +456,46 @@ def list_mod_profiles(game_name: str | None = None) -> dict[str, Any]:
             }
             for p in profiles
         ],
-        "hints": [
+        "hints": _profile_hints(profiles, incomplete),
+    }
+
+
+def _profile_hints(profiles: list[Any], incomplete: list[Any]) -> list[str]:
+    """What to say about a listing, including when it is empty of usable ones.
+
+    An empty `profiles` list used to mean "no manager is installed", which is
+    wrong once profiles with no loader are accounted for separately: a user
+    whose only profile is a new one has profiles, just none ready yet, and
+    telling them none were found sends them looking for the wrong problem.
+    """
+    if profiles:
+        hints = [
             "A profile with few mods keeps the log readable and makes a "
             "failure attributable to your mod. Test against a busy profile "
             "when you need to check for conflicts.",
             "Any loader tree works, listed or not -- pass its path directly.",
         ]
-        if profiles
-        else [
-            "No mod-manager profiles found; mods will deploy into the game "
-            "folder. Pass a path directly if your manager keeps them "
-            "somewhere ModWright does not know about.",
-        ],
-    }
+        if incomplete:
+            hints.append(
+                f"{len(incomplete)} more profile(s) exist but have no loader "
+                "in them yet -- see `unavailable`, which says what to install."
+            )
+        return hints
+
+    if incomplete:
+        return [
+            "Profiles exist for this game, but none has a mod loader in it "
+            "yet, so none can be deployed into. See `unavailable` for each "
+            "one and what to install.",
+            "Report them by name rather than treating the list as empty: a "
+            "profile the user just created is the one they will ask about.",
+        ]
+
+    return [
+        "No mod-manager profiles found; mods will deploy into the game "
+        "folder. Pass a path directly if your manager keeps them "
+        "somewhere ModWright does not know about.",
+    ]
 
 
 @mcp.tool()

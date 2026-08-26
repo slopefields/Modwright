@@ -340,6 +340,30 @@ class BepInEx5Adapter:
             log_path=log_path if log_path.exists() else None,
         )
 
+    #: What to install in a mod manager to get BepInEx and nothing else.
+    #: Installing a gameplay mod also pulls it in, as a dependency, but drags
+    #: that mod and its own dependencies along with it -- which is how a
+    #: profile meant for testing one mod ends up with six.
+    _LOADER_PACKAGE = "BepInExPack"
+
+    def explain_unusable_loader_root(self, loader_root: Path) -> str | None:
+        loader_dir = loader_root / "BepInEx"
+        if not loader_dir.is_dir():
+            return (
+                "No BepInEx here yet, which is the normal state of a profile "
+                f"nothing has been installed into. Install {self._LOADER_PACKAGE} "
+                "into it through the mod manager: that is the loader on its "
+                "own, so the profile stays empty apart from the mod being "
+                "developed and its log stays readable."
+            )
+        if not (loader_dir / "core").is_dir():
+            return (
+                "BepInEx is here but BepInEx/core is missing, so the loader "
+                "itself is absent -- this tree would accept a deployed file "
+                f"and load nothing. Reinstall {self._LOADER_PACKAGE} into it."
+            )
+        return None
+
     def adopt_loader_root(
         self, game_context: GameContext, loader_root: Path
     ) -> GameContext:
@@ -369,9 +393,13 @@ class BepInEx5Adapter:
             raise InvalidDeployRootError(
                 f"{loader_root} has no BepInEx installed.",
                 hints=[
-                    "If this is a new profile, install BepInEx into it -- "
-                    "installing any mod through the manager pulls it in, or "
-                    "install the BepInEx pack on its own.",
+                    # Leads with the loader-only package deliberately. The
+                    # "install any mod" version of this hint is what put a
+                    # debug menu into a test profile, where it fought the mod
+                    # under development for the same field.
+                    f"If this is a new profile, install {self._LOADER_PACKAGE} "
+                    "into it through the mod manager -- that is BepInEx on its "
+                    "own, and leaves the profile clean for testing.",
                     "If this was meant to be a game install, check the path.",
                 ],
             )

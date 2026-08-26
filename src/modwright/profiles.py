@@ -26,6 +26,7 @@ MelonLoader profiles hold `Mods/` where BepInEx holds `BepInEx/plugins`.
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -72,6 +73,18 @@ class ModProfile:
         entries per profile to answer a question nobody asked.
         """
         return len(list(self.mods_dir.iterdir())) if self.mods_dir.is_dir() else 0
+
+
+@dataclass(frozen=True)
+class IncompleteProfile:
+    """A profile directory with no loader in it, and why that is."""
+
+    manager: str
+    game_folder: str
+    name: str
+    path: Path
+    #: In the framework's own words -- which package to install to fix it.
+    reason: str
 
 
 def manager_data_dirs() -> list[Path]:
@@ -122,14 +135,16 @@ def _read_profile(manager: str, game_folder: str, path: Path) -> ModProfile | No
     return None  # No adapter can deploy here, so it is not worth offering.
 
 
-def discover_profiles(game_name: str | None = None) -> list[ModProfile]:
-    """List mod-manager profiles, optionally narrowed to one game.
+def _walk_profile_dirs(
+    game_name: str | None,
+) -> Iterator[tuple[str, str, Path]]:
+    """Every directory a manager keeps as a profile, claimed or not.
 
-    `game_name` is matched loosely against the manager's own game folder,
-    since managers strip spacing ('Lethal Company' -> 'LethalCompany').
+    Shared by both listings below so they cannot drift into disagreeing about
+    which directories exist -- the whole point of the second listing is that
+    it accounts for exactly what the first one leaves out.
     """
     wanted = _normalise(game_name) if game_name else None
-    profiles: list[ModProfile] = []
 
     for root in manager_data_dirs():
         manager = _manager_name(root)
@@ -142,10 +157,65 @@ def discover_profiles(game_name: str | None = None) -> list[ModProfile]:
             if not profiles_dir.is_dir():
                 continue
             for profile_dir in sorted(profiles_dir.iterdir()):
-                if not profile_dir.is_dir():
-                    continue
-                profile = _read_profile(manager, game_dir.name, profile_dir)
-                if profile is not None:
-                    profiles.append(profile)
+                if profile_dir.is_dir():
+                    yield manager, game_dir.name, profile_dir
 
-    return profiles
+
+def discover_profiles(game_name: str | None = None) -> list[ModProfile]:
+    """List mod-manager profiles that can actually be deployed into.
+
+    `game_name` is matched loosely against the manager's own game folder,
+    since managers strip spacing ('Lethal Company' -> 'LethalCompany').
+
+    A profile with no loader in it is left out, because deploying there would
+    load nothing. `discover_incomplete_profiles` accounts for those, so the
+    two together cover every profile directory on disk.
+    """
+    found = [
+        profile
+        for manager, game_folder, path in _walk_profile_dirs(game_name)
+        if (profile := _read_profile(manager, game_folder, path)) is not None
+    ]
+    return found
+
+
+def discover_incomplete_profiles(
+    game_name: str | None = None,
+) -> list[IncompleteProfile]:
+    """Profile directories that exist but hold no loader yet.
+
+    The normal state of a profile just created in a manager: managers do not
+    install the loader until something is installed into the profile. Reported
+    rather than skipped because a user who has just made a profile and named
+    it will look for that name, and its absence reads as the tool being broken
+    -- which is exactly what it cost when it was left out.
+
+    Deliberately a SEPARATE list from `discover_profiles`, not a flag on one
+    combined list: these cannot be deployed into, and a caller that forgot to
+    check a flag would offer one anyway.
+    """
+    incomplete: list[IncompleteProfile] = []
+    for manager, game_folder, path in _walk_profile_dirs(game_name):
+        if _read_profile(manager, game_folder, path) is not None:
+            continue
+        # First adapter with something to say. The directory's location is
+        # what establishes it was meant to be a loader tree; the adapter only
+        # has to name what is missing.
+        reason = next(
+            (
+                explanation
+                for adapter in ADAPTERS
+                if (explanation := adapter.explain_unusable_loader_root(path))
+            ),
+            "No mod loader is installed in this profile yet.",
+        )
+        incomplete.append(
+            IncompleteProfile(
+                manager=manager,
+                game_folder=game_folder,
+                name=path.name,
+                path=path,
+                reason=reason,
+            )
+        )
+    return incomplete
