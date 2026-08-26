@@ -9,6 +9,7 @@ committed, regenerated on demand).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import shutil
 
@@ -96,7 +97,7 @@ class TestACloneWithoutPaths:
         """Not an error to retry: nobody could have known these paths, so the
         answer is to ask rather than to guess."""
         clone, _ = cloned
-        result = server.build_mod(str(clone))
+        result = asyncio.run(server.build_mod(str(clone)))
 
         assert result["code"] == "project_not_configured"
         assert any("set_game_install" in h for h in result["hints"])

@@ -7,6 +7,7 @@ the split: assemblies stay with the game, deploy and logs follow the loader.
 
 from __future__ import annotations
 
+import asyncio
 import pytest
 
 from modwright import server
@@ -208,7 +209,7 @@ class TestChoosingBeforeValidating:
 
         from modwright import server
 
-        result = server.deploy_mod(str(project))
+        result = asyncio.run(server.deploy_mod(str(project)))
 
         assert result["code"] == "deploy_target_unset"
         assert [p["name"] for p in result["profiles"]] == ["dev"]
@@ -226,7 +227,7 @@ class TestChoosingBeforeValidating:
 
         from modwright import server
 
-        result = server.deploy_mod(str(project))
+        result = asyncio.run(server.deploy_mod(str(project)))
         # Fails on the build (no real project), never on an unset target.
         assert result.get("code") != "deploy_target_unset"
 
@@ -281,7 +282,7 @@ class TestFrameworksWithoutADestination:
         from modwright.adapters.bepinex5 import BepInEx5Adapter
 
         monkeypatch.setattr(BepInEx5Adapter, "supports_deploy_target", False)
-        result = server.deploy_mod(str(project))
+        result = asyncio.run(server.deploy_mod(str(project)))
         assert result.get("code") != "deploy_target_unset"
 
 

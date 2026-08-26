@@ -9,6 +9,7 @@ assemblies that must not be referenced.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shutil
@@ -18,7 +19,7 @@ import pytest
 from modwright import server
 from modwright.adapters import detect_framework
 from modwright.adapters.bepinex5 import PROPS_FILENAME, BepInEx5Adapter
-from modwright.errors import BuildFailedError
+from modwright.errors import BuildFailedError, DecompilerUnavailableError
 from modwright.models import BuildOutcome
 from modwright.mods import find_installed_mod, list_installed_mods, read_installed_mod
 from modwright.project_config import ModReference, ProjectConfig
@@ -466,7 +467,7 @@ class TestChangedDependencyHint:
             BepInEx5Adapter, "build",
             lambda self, p: (_ for _ in ()).throw(BuildFailedError("nope")),
         )
-        result = server.build_mod(str(path))
+        result = asyncio.run(server.build_mod(str(path)))
 
         assert result["success"] is False
         assert any(
@@ -484,7 +485,7 @@ class TestChangedDependencyHint:
             BepInEx5Adapter, "build",
             lambda self, p: (_ for _ in ()).throw(BuildFailedError("nope")),
         )
-        result = server.build_mod(str(path))
+        result = asyncio.run(server.build_mod(str(path)))
 
         assert result["success"] is False
         assert "reference_warnings" not in result
@@ -503,7 +504,142 @@ class TestChangedDependencyHint:
             BepInEx5Adapter, "build",
             lambda self, p: BuildOutcome(artifact=p / "out.dll"),
         )
-        result = server.build_mod(str(path))
+        result = asyncio.run(server.build_mod(str(path)))
 
         assert result["success"] is True
         assert "reference_warnings" not in result
+
+
+def _stub_build(monkeypatch):
+    """Skip the real compile: these tests are about what happens around it."""
+    artifact = None
+
+    def _build(self, project):
+        nonlocal artifact
+        artifact = project / "bin" / f"{project.name}.dll"
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact.write_bytes(b"dll")
+        return BuildOutcome(artifact=artifact)
+
+    monkeypatch.setattr("modwright.adapters.bepinex5.BepInEx5Adapter.build", _build)
+
+class TestPatchNamesCheckedOnTheWayThrough:
+    """Harmony resolves its target by string at launch, so the compiler never
+    sees a typo and the build passes. The check for that existed as its own
+    tool and was simply never called: the rehearsal agent deployed four times
+    and called `build_mod` zero times, so a check reachable only through a
+    tool nothing reaches for was no check at all. Both paths to a DLL now run
+    it.
+    """
+
+    @pytest.fixture()
+    def report(self, monkeypatch):
+        """Stand in for DecompilerServer, which these tests must not spawn."""
+
+        def _use(missing=(), found=(), unchecked=(), unavailable=None):
+            async def _fake(project, context, adapter):
+                if unavailable:
+                    raise DecompilerUnavailableError(unavailable)
+                return {
+                    "valid": not missing,
+                    "checked": len(missing) + len(found),
+                    "missing": [
+                        {"target": t, "file": "Plugin.cs", "line": 1,
+                         "did_you_mean": []} for t in missing
+                    ],
+                    "found": [{"target": t, "line": 1} for t in found],
+                    "unchecked": [
+                        {"target": t, "file": "Plugin.cs", "line": 1,
+                         "reason": "not a literal"} for t in unchecked
+                    ],
+                }
+
+            monkeypatch.setattr(server, "_validate_patches", _fake)
+
+        return _use
+
+    def test_a_clean_build_says_the_check_ran(self, project, report, monkeypatch):
+        report(found=("A.Start", "A.Update"))
+        _stub_build(monkeypatch)
+        path, _ = project
+
+        result = asyncio.run(server.build_mod(str(path)))
+
+        assert result["patches_checked"] == 2
+        assert "patch_warnings" not in result
+
+    def test_a_bad_patch_name_is_reported_without_failing_the_build(
+        self, project, report, monkeypatch
+    ):
+        """It still compiles and is still worth deploying -- the mod just will
+        not load until the name is fixed, which only launching would reveal."""
+        report(missing=("A.LateUpdte",))
+        _stub_build(monkeypatch)
+        path, _ = project
+
+        result = asyncio.run(server.build_mod(str(path)))
+
+        assert result["success"] is True
+        assert result["patches_missing"][0]["target"] == "A.LateUpdte"
+        assert result["patch_warnings"]
+
+    def test_deploy_runs_the_same_check(self, project, report, monkeypatch):
+        """The path the agent actually takes. Putting this in `build_mod`
+        alone would have missed every deploy in the rehearsal."""
+        report(missing=("A.LateUpdte",))
+        _stub_build(monkeypatch)
+        path, _ = project
+
+        result = asyncio.run(server.deploy_mod(str(path)))
+
+        assert result["success"] is True
+        assert result["patches_missing"][0]["target"] == "A.LateUpdte"
+
+    def test_an_unreachable_decompiler_says_so_rather_than_passing_quietly(
+        self, project, report, monkeypatch
+    ):
+        """A check that silently does not run reads exactly like one that
+        passed. That confusion is what made an empty log unreadable, and it
+        must not be reintroduced here."""
+        report(unavailable="DecompilerServer executable not configured.")
+        _stub_build(monkeypatch)
+        path, _ = project
+
+        result = asyncio.run(server.build_mod(str(path)))
+
+        assert result["success"] is True
+        assert "not configured" in result["patches_unchecked"]
+        assert "patches_checked" not in result
+
+    def test_targets_that_cannot_be_read_are_listed_separately(
+        self, project, report, monkeypatch
+    ):
+        """A target built from a variable is unverifiable without compiling.
+        Neither passed nor failed -- reported as what it is."""
+        report(found=("A.Start",), unchecked=("A.<computed>",))
+        _stub_build(monkeypatch)
+        path, _ = project
+
+        result = asyncio.run(server.build_mod(str(path)))
+
+        assert result["patches_not_literal"][0]["target"] == "A.<computed>"
+
+    def test_a_failed_build_does_not_pay_for_the_check(
+        self, project, monkeypatch
+    ):
+        """The compiler error is the more urgent answer and arrives in a
+        fraction of the time."""
+        def _never(*args, **kwargs):
+            raise AssertionError("validated a build that failed")
+
+        monkeypatch.setattr(server, "_validate_patches", _never)
+        monkeypatch.setattr(
+            "modwright.adapters.bepinex5.BepInEx5Adapter.build",
+            lambda self, p: (_ for _ in ()).throw(BuildFailedError("nope")),
+        )
+        path, _ = project
+
+        result = asyncio.run(server.build_mod(str(path)))
+
+        assert result["success"] is False
+        assert result["code"] == "build_failed"

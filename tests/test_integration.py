@@ -11,6 +11,7 @@ Deploy is exercised against a synthetic install rather than the real
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -43,7 +44,7 @@ class TestDetection:
 @pytest.mark.dotnet
 class TestBuild:
     def test_scaffolded_project_compiles(self, real_project, requires_dotnet):
-        result = server.build_mod(str(real_project))
+        result = asyncio.run(server.build_mod(str(real_project)))
         assert result["success"], result
         assert result["artifact"].endswith("TestMod.dll")
         assert result["deploy_required"] is True
@@ -55,7 +56,7 @@ class TestBuild:
             "class Broken { void M() { return undefined_symbol; } }",
             encoding="utf-8",
         )
-        result = server.build_mod(str(real_project))
+        result = asyncio.run(server.build_mod(str(real_project)))
 
         assert not result["success"]
         assert result["code"] == "build_failed"

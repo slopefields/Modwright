@@ -20,6 +20,7 @@ from modwright.adapters import detect_framework, get_adapter
 from modwright.diagnosis import diagnose_silence, last_deployed, mtime_of
 from modwright.errors import (
     BuildFailedError,
+    DecompilerUnavailableError,
     DeployTargetUnsetError,
     LogNotFoundError,
     ModReferenceNotFoundError,
@@ -27,7 +28,7 @@ from modwright.errors import (
 )
 from modwright.logs import read_since
 from modwright.mods import find_installed_mod, list_installed_mods
-from modwright.models import GameContext
+from modwright.models import BuildOutcome, GameContext
 from modwright.profiles import discover_incomplete_profiles, discover_profiles
 from modwright.project_config import ModReference, ProjectConfig
 from modwright.validation import validate_targets
@@ -133,7 +134,7 @@ def _require_chosen_target(
             "player launches the same profile it was deployed into.",
             "To install into the game folder itself, pass that path to "
             "set_deploy_target explicitly.",
-            # Deliberately does not name the loader package: which one it is "
+            # Deliberately does not name the loader package: which one it is
             # is the adapter's knowledge, and list_mod_profiles reports it
             # per-profile in the framework's own words.
             "A fresh profile is often the better answer than reusing a busy "
@@ -260,7 +261,20 @@ async def validate_mod_patches(project_path: str) -> dict[str, Any]:
     This runs that same lookup against the game assembly's metadata first.
     """
     context, adapter, _ = _context_for_project(Path(project_path))
-    extracted = adapter.extract_patch_targets(Path(project_path))
+    return {"success": True, **await _validate_patches(Path(project_path), context, adapter)}
+
+
+async def _validate_patches(
+    project: Path, context: GameContext, adapter: Any
+) -> dict[str, Any]:
+    """The patch check itself, without the tool envelope.
+
+    Split out so the build path can run the same check rather than a second
+    implementation of it: two versions of "does this method exist" would
+    eventually disagree, and the one nobody calls directly is the one that
+    would rot.
+    """
+    extracted = adapter.extract_patch_targets(project)
 
     # Targets whose attribute arguments were not literals cannot be checked
     # without compiling; they are reported as unchecked rather than passed.
@@ -271,7 +285,6 @@ async def validate_mod_patches(project_path: str) -> dict[str, Any]:
     missing = [v for v in validated if not v.exists]
 
     return {
-        "success": True,
         "valid": not missing,
         "checked": len(validated),
         "missing": [
@@ -301,17 +314,53 @@ async def validate_mod_patches(project_path: str) -> dict[str, Any]:
 
 
 @mcp.tool()
-@_tool
-def build_mod(project_path: str) -> dict[str, Any]:
-    """Compile the mod project.
+@_async_tool
+async def build_mod(project_path: str) -> dict[str, Any]:
+    """Compile the mod project, checking its patch targets on the way.
 
     Some frameworks place the finished artifact during the build itself; the
     response says which happened so the agent knows whether a deploy is still
     needed.
+
+    A successful build also reports `patches_checked`. Harmony names its target
+    method with a plain string that the compiler never checks, so a typo builds
+    cleanly and fails only at launch -- checking here means a rebuild catches
+    it, including after a game update renames something.
     """
     context, adapter, config = _context_for_project(Path(project_path))
+    outcome, checked = await _build_and_check(
+        Path(project_path), context, adapter, config
+    )
+    response = {
+        "success": True,
+        "artifact": str(outcome.artifact) if outcome.artifact else None,
+        "deployed_by_build": outcome.deployed_by_build,
+        "deploy_required": not outcome.deployed_by_build,
+        "log": outcome.log,
+        **checked,
+    }
+    drift = _reference_drift(context, config)
+    if drift:
+        response["reference_warnings"] = drift
+    return response
+
+
+async def _build_and_check(
+    project: Path, context: GameContext, adapter: Any, config: ProjectConfig
+) -> tuple[BuildOutcome, dict[str, Any]]:
+    """Compile, then check the patch targets. Shared by build and deploy.
+
+    A private helper rather than one tool calling another: `build_mod` returns
+    a response envelope of strings, while deploy needs the `BuildOutcome`
+    object itself, and reconstructing that from its own report would have to
+    re-establish an invariant the dataclass already guarantees.
+
+    Deploy runs this too, because the agent that motivated it never called
+    `build_mod` once -- four deploys, zero builds. A check reachable only
+    through a tool nothing reaches for is not a check.
+    """
     try:
-        outcome = adapter.build(Path(project_path))
+        outcome = adapter.build(project)
     except BuildFailedError as exc:
         # Only when the build breaks. A dependency's assembly timestamp moves
         # every time it is rebuilt and redeployed, which during development is
@@ -322,17 +371,45 @@ def build_mod(project_path: str) -> dict[str, Any]:
         if changed:
             exc.details.setdefault("reference_warnings", []).extend(changed)
         raise
-    response = {
-        "success": True,
-        "artifact": str(outcome.artifact) if outcome.artifact else None,
-        "deployed_by_build": outcome.deployed_by_build,
-        "deploy_required": not outcome.deployed_by_build,
-        "log": outcome.log,
-    }
-    drift = _reference_drift(context, config)
-    if drift:
-        response["reference_warnings"] = drift
-    return response
+
+    # After the build, never before. A compile error is the more urgent
+    # answer and arrives in a fraction of the time; spending the check on a
+    # build that failed would delay it for nothing.
+    return outcome, await _check_patches_quietly(project, context, adapter)
+
+
+async def _check_patches_quietly(
+    project: Path, context: GameContext, adapter: Any
+) -> dict[str, Any]:
+    """Patch validation folded into another tool's response.
+
+    Quiet when everything resolves -- a count, so the agent can see it ran --
+    and loud only about what it could not confirm. The full listing stays in
+    `validate_mod_patches` for when someone asks the question directly.
+
+    Never fails the build it is attached to. The check needs DecompilerServer,
+    which is a separate process a user may not have set up, and a mod whose
+    patch names are merely unverified still compiles and still deploys. But
+    silence would be the wrong way to say so: a check that quietly does not
+    run is indistinguishable from one that passed, which is the exact trap
+    that made an empty log unreadable.
+    """
+    try:
+        report = await _validate_patches(project, context, adapter)
+    except DecompilerUnavailableError as exc:
+        return {"patches_unchecked": exc.args[0] if exc.args else str(exc)}
+
+    checked: dict[str, Any] = {"patches_checked": report["checked"]}
+    if report["missing"]:
+        checked["patches_missing"] = report["missing"]
+        checked["patch_warnings"] = [
+            "These patch targets do not exist in the game assembly. Harmony "
+            "resolves them by name at launch, so the mod will fail to load "
+            "until they are corrected -- the build itself cannot catch this.",
+        ]
+    if report["unchecked"]:
+        checked["patches_not_literal"] = report["unchecked"]
+    return checked
 
 
 def _installed_dependencies(
@@ -722,22 +799,29 @@ def remove_mod_reference(project_path: str, package: str) -> dict[str, Any]:
 
 
 @mcp.tool()
-@_tool
-def deploy_mod(project_path: str) -> dict[str, Any]:
+@_async_tool
+async def deploy_mod(project_path: str) -> dict[str, Any]:
     """Build the mod and place it where the game loads mods from.
 
     That is the project's configured deploy target -- a mod-manager profile
     when one is set, otherwise the game install.
+
+    Builds rather than copying whatever is already there, so what runs in the
+    game always matches the source on disk. Reports `patches_checked` the same
+    way `build_mod` does, since this is the last step before a launch.
     """
     context, adapter, config = _context_for_project(Path(project_path))
     _require_chosen_target(context, adapter, config)
-    outcome = adapter.build(Path(project_path))
+    outcome, checked = await _build_and_check(
+        Path(project_path), context, adapter, config
+    )
     deployed = adapter.deploy(outcome, context)
     return {
         "success": True,
         "destination": str(deployed.destination),
         "copied": deployed.copied,
         "deploy_root": config.deploy_root,
+        **checked,
     }
 
 
