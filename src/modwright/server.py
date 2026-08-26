@@ -17,7 +17,7 @@ from typing import Any, Callable
 from mcp.server import MCPServer
 
 from modwright.adapters import detect_framework, get_adapter
-from modwright.diagnosis import diagnose_empty_log
+from modwright.diagnosis import diagnose_silence, last_deployed, mtime_of
 from modwright.errors import (
     BuildFailedError,
     DeployTargetUnsetError,
@@ -80,14 +80,11 @@ def _context_for_project(project_path: Path) -> tuple[GameContext, Any, ProjectC
     return context, adapter, config
 
 
-def _isoformat(path: Path) -> str | None:
-    """When a file was last written, or None if it cannot be read."""
-    try:
-        return datetime.fromtimestamp(path.stat().st_mtime).isoformat(
-            timespec="seconds"
-        )
-    except OSError:
+def _isoformat(mtime: float | None) -> str | None:
+    """A timestamp as text, or None when there is no timestamp to report."""
+    if mtime is None:
         return None
+    return datetime.fromtimestamp(mtime).isoformat(timespec="seconds")
 
 
 def _require_chosen_target(
@@ -369,15 +366,11 @@ def _changed_references(context: GameContext, config: ProjectConfig) -> list[str
             warnings.append(
                 f"{reference.package} has changed on disk since this project "
                 f"started referencing it "
-                f"(now {_isoformat_stamp(now)}, was "
-                f"{_isoformat_stamp(reference.assembly_mtime_when_added)}). "
+                f"(now {_isoformat(now)}, was "
+                f"{_isoformat(reference.assembly_mtime_when_added)}). "
                 "If the build only just started failing, check that first."
             )
     return warnings
-
-
-def _isoformat_stamp(mtime: float) -> str:
-    return datetime.fromtimestamp(mtime).isoformat(timespec="seconds")
 
 
 def _reference_drift(context: GameContext, config: ProjectConfig) -> list[str]:
@@ -697,11 +690,16 @@ def watch_mod_logs(
     cursor while reproducing an issue in-game. An MCP server cannot push
     updates, so the agent drives the loop.
 
-    When nothing comes back, a `diagnosis` explains the silence -- most often
-    that the game was launched through a different loader than the one this
-    mod deploys into, which otherwise fails completely silently. Its `reason`
-    reports what was observed, not what caused it: ask the user before acting
-    on it, since the likeliest fixes are opposites.
+    Every read reports `log_written_at` and `deployed_at`. Compare them before
+    trusting the content: a log older than the deploy holds only text from
+    before this build existed, which reads exactly like a live session.
+
+    A `diagnosis` explains the silence whenever there is silence to explain --
+    nothing new to read, or nothing written since the deploy. Most often the
+    game was launched through a different loader than the one this mod deploys
+    into, which otherwise fails completely silently. Its `reason` reports what
+    was observed, not what caused it: ask the user before acting on it, since
+    the likeliest fixes are opposites.
     """
     context, adapter, _ = _context_for_project(Path(project_path))
     log_path = adapter.resolve_log(context)
@@ -713,26 +711,37 @@ def watch_mod_logs(
         raise LogNotFoundError(
             f"No log file found for {context.game_name}.",
             hints=["Run the game at least once with the mod loader installed."],
-            details={"diagnosis": diagnose_empty_log(context, adapter, None)},
+            details={"diagnosis": diagnose_silence(context, adapter, None)},
         )
 
     read = read_since(log_path, since_cursor=since_cursor, lines=lines)
+    # Both on every read, not just empty ones. A read with no cursor returns
+    # the tail of whatever is already there, which can be weeks old, and the
+    # text alone cannot be told apart from a live session. One timestamp does
+    # not settle it either -- there has to be something to compare it against.
+    log_written_at = mtime_of(log_path)
+    deployed_at = last_deployed(context)
     response = {
         "success": True,
         "log_path": str(read.path),
         "cursor": read.cursor,
         "content": read.content,
-        # On every read, not just empty ones. The first poll of a session
-        # returns the tail of whatever is already there, which can be weeks
-        # old -- content alone gives no way to tell that apart from a live
-        # session, and it costs one stat to say so.
-        "log_written_at": _isoformat(log_path),
+        "log_written_at": _isoformat(log_written_at),
+        "deployed_at": _isoformat(deployed_at),
     }
-    if not read.content:
-        # Only when there is silence to explain. Content in the log proves
-        # this loader ran, which makes the whole diagnosis unnecessary -- and
-        # this is the one tool an agent polls in a loop.
-        response["diagnosis"] = diagnose_empty_log(context, adapter, log_path)
+
+    # Stale content is silence too. Gating on an empty read alone missed the
+    # most common shape of this bug entirely: after a redeploy the agent reads
+    # afresh, gets a full tail written before the build it just made, and has
+    # nothing to tell it so.
+    stale = deployed_at is not None and (
+        log_written_at is None or log_written_at < deployed_at
+    )
+    if not read.content or stale:
+        # Still gated. A log written since the deploy proves this loader ran,
+        # which settles the question outright -- and this is the one tool an
+        # agent polls in a loop, so the profile scan must stay off that path.
+        response["diagnosis"] = diagnose_silence(context, adapter, log_path)
     return response
 
 

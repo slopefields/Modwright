@@ -5,10 +5,11 @@ anywhere: the build compiles, the copy succeeds, every step reports success,
 and the log simply has nothing in it. It is the hardest failure in this tool
 to diagnose from its symptom, because the symptom is silence.
 
-This module turns that silence into evidence. It runs only when a log read
-came back empty -- content in the log *proves* the loader ran, so there is
-nothing to explain otherwise, and the check stays off the hot path of a tool
-an agent polls repeatedly.
+This module turns that silence into evidence. It runs when a log read came
+back empty, and when the log has not been written since the mod was deployed
+-- stale content is silence too, and looks identical to a live session from
+the text alone. It stays off the hot path otherwise: a log written after the
+deploy *proves* the loader ran, and there is nothing left to explain.
 
 Two rules shape everything here:
 
@@ -78,13 +79,14 @@ class _Candidate:
     manager: str | None = None
 
 
-def diagnose_empty_log(
+def diagnose_silence(
     context: GameContext, adapter: Any, target_log: Path | None
 ) -> dict[str, Any]:
-    """Explain why the target loader's log is empty (or absent).
+    """Explain why the target loader shows no sign of having run.
 
     `target_log` is None when no log file exists at all -- the strongest form
-    of the same symptom, not a separate problem.
+    of the same symptom, not a separate problem. A log holding only text from
+    before the deploy is the same symptom again, one step weaker.
     """
     target_root = context.effective_loader_root
 
@@ -96,14 +98,14 @@ def diagnose_empty_log(
         return _payload(LOGGING_DISABLED, target_root, hints=[status.hint])
 
     newest = _most_recent_other_loader(context, adapter, target_root)
-    target_written = _mtime(target_log)
+    target_written = mtime_of(target_log)
 
     # Rank every loader against the moment the mod was put in place, before
     # ranking them against each other. Without this, two logs left over from
     # last week get compared and the older one is reported as the wrong
     # profile -- on the very first poll, before the player has had a chance
     # to launch anything.
-    deployed_at = _last_deployed(context)
+    deployed_at = last_deployed(context)
     latest_run = max(
         (t for t in (target_written, newest.written_at if newest else None)
          if t is not None),
@@ -188,7 +190,7 @@ def _candidates(context: GameContext, adapter: Any) -> list[_Candidate]:
         _Candidate(
             label=f"Profile {profile.name!r} ({profile.manager})",
             path=profile.path,
-            written_at=_mtime(profile.log_path),
+            written_at=mtime_of(profile.log_path),
             manager=profile.manager,
         )
         for profile in discover_profiles(context.game_name)
@@ -202,13 +204,13 @@ def _candidates(context: GameContext, adapter: Any) -> list[_Candidate]:
             _Candidate(
                 label="The game folder's own loader",
                 path=context.install_root,
-                written_at=_mtime(info.log_path),
+                written_at=mtime_of(info.log_path),
             )
         )
     return found
 
 
-def _last_deployed(context: GameContext) -> float | None:
+def last_deployed(context: GameContext) -> float | None:
     """When something was last installed into the target's mods folder.
 
     Read as the newest file in there rather than the folder's own timestamp:
@@ -236,7 +238,7 @@ def _payload(reason: str, loader_root: Path, hints: list[str]) -> dict[str, Any]
     }
 
 
-def _mtime(path: Path | None) -> float | None:
+def mtime_of(path: Path | None) -> float | None:
     if path is None or not path.is_file():
         return None
     try:

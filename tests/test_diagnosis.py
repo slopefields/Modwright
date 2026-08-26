@@ -25,7 +25,7 @@ from modwright.diagnosis import (
     LOADER_WROTE_NOTHING,
     LOGGING_DISABLED,
     OTHER_LOADER_RAN_LATER,
-    diagnose_empty_log,
+    diagnose_silence,
 )
 from modwright.project_config import ProjectConfig
 
@@ -36,6 +36,21 @@ def _age(path, *, seconds: int) -> None:
     """Backdate a file, so "which ran last" is unambiguous in a fast test."""
     when = os.stat(path).st_mtime - seconds
     os.utime(path, (when, when))
+
+
+def _deploy(loader_root, *, age_days: int = 0):
+    """Put a built plugin in place the way `deploy` really does.
+
+    `shutil.copy2` carries the build's timestamp across, so the file's mtime
+    is when the code was built, not when it was copied.
+    """
+    artifact = loader_root / "BepInEx" / "plugins" / "MyMod.dll"
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    artifact.write_bytes(b"plugin")
+    if age_days:
+        when = os.stat(artifact).st_mtime - age_days * 86400
+        os.utime(artifact, (when, when))
+    return artifact
 
 
 @pytest.fixture()
@@ -157,7 +172,7 @@ class TestDiagnosis:
         only_these_profiles(target, other)
 
         context = adapter.adopt_loader_root(detect_framework(game), target)
-        result = diagnose_empty_log(context, adapter, None)
+        result = diagnose_silence(context, adapter, None)
 
         assert result["reason"] == LOGGING_DISABLED
         assert "more_recent_loader" not in result
@@ -173,7 +188,7 @@ class TestDiagnosis:
         _age(target_log, seconds=3600)
 
         context = adapter.adopt_loader_root(detect_framework(game), target)
-        result = diagnose_empty_log(context, adapter, target_log)
+        result = diagnose_silence(context, adapter, target_log)
 
         assert result["reason"] == OTHER_LOADER_RAN_LATER
         assert result["more_recent_loader"]["path"] == str(other)
@@ -190,7 +205,7 @@ class TestDiagnosis:
         only_these_profiles(target, other)
 
         context = adapter.adopt_loader_root(detect_framework(game), target)
-        result = diagnose_empty_log(context, adapter, None)
+        result = diagnose_silence(context, adapter, None)
 
         assert result["reason"] == OTHER_LOADER_RAN_LATER
         assert result["more_recent_loader"]["path"] == str(other)
@@ -205,7 +220,7 @@ class TestDiagnosis:
         only_these_profiles(target)
 
         context = adapter.adopt_loader_root(detect_framework(game), target)
-        result = diagnose_empty_log(
+        result = diagnose_silence(
             context, adapter, target / "BepInEx" / "LogOutput.log"
         )
 
@@ -221,7 +236,7 @@ class TestDiagnosis:
         _age(other / "BepInEx" / "LogOutput.log", seconds=3600)
 
         context = adapter.adopt_loader_root(detect_framework(game), target)
-        result = diagnose_empty_log(
+        result = diagnose_silence(
             context, adapter, target / "BepInEx" / "LogOutput.log"
         )
 
@@ -238,7 +253,7 @@ class TestDiagnosis:
         only_these_profiles(target)
 
         context = adapter.adopt_loader_root(detect_framework(game), target)
-        result = diagnose_empty_log(context, adapter, None)
+        result = diagnose_silence(context, adapter, None)
 
         assert result["reason"] == LOADER_WROTE_NOTHING
         assert any("never have been launched" in hint for hint in result["hints"])
@@ -254,7 +269,7 @@ class TestDiagnosis:
         only_these_profiles(target)
 
         context = adapter.adopt_loader_root(detect_framework(game), target)
-        result = diagnose_empty_log(context, adapter, None)
+        result = diagnose_silence(context, adapter, None)
 
         assert result["reason"] == OTHER_LOADER_RAN_LATER
         assert result["more_recent_loader"]["path"] == str(game)
@@ -270,7 +285,7 @@ class TestDiagnosis:
         only_these_profiles(target, other)
 
         context = adapter.adopt_loader_root(detect_framework(game), target)
-        hints = " ".join(diagnose_empty_log(context, adapter, None)["hints"])
+        hints = " ".join(diagnose_silence(context, adapter, None)["hints"])
 
         assert "Ask the user" in hints
         assert "do not switch" in hints
@@ -340,20 +355,6 @@ class TestNothingRanYet:
     both the most common poll there is and a confidently wrong answer.
     """
 
-    def _deploy(self, loader_root, *, age_days: int = 0):
-        """Put a built plugin in place the way `deploy` really does.
-
-        `shutil.copy2` carries the build's timestamp across, so the file's
-        mtime is when the code was built, not when it was copied.
-        """
-        artifact = loader_root / "BepInEx" / "plugins" / "MyMod.dll"
-        artifact.parent.mkdir(parents=True, exist_ok=True)
-        artifact.write_bytes(b"plugin")
-        if age_days:
-            when = os.stat(artifact).st_mtime - age_days * 86400
-            os.utime(artifact, (when, when))
-        return artifact
-
     def test_stale_rivals_are_not_reported_as_the_wrong_profile(
         self, adapter, fake_game, profile, only_these_profiles
     ):
@@ -364,10 +365,10 @@ class TestNothingRanYet:
         # Both logs predate the deploy: nobody has launched anything since.
         _age(target / "BepInEx" / "LogOutput.log", seconds=7 * 86400)
         _age(other / "BepInEx" / "LogOutput.log", seconds=2 * 86400)
-        self._deploy(target)
+        _deploy(target)
 
         context = adapter.adopt_loader_root(detect_framework(game), target)
-        result = diagnose_empty_log(
+        result = diagnose_silence(
             context, adapter, target / "BepInEx" / "LogOutput.log"
         )
 
@@ -384,10 +385,10 @@ class TestNothingRanYet:
         other = profile("other", log=True, disk_logging=True)
         only_these_profiles(target, other)
         _age(target / "BepInEx" / "LogOutput.log", seconds=7 * 86400)
-        self._deploy(target, age_days=1)  # built yesterday, other ran since
+        _deploy(target, age_days=1)  # built yesterday, other ran since
 
         context = adapter.adopt_loader_root(detect_framework(game), target)
-        result = diagnose_empty_log(
+        result = diagnose_silence(
             context, adapter, target / "BepInEx" / "LogOutput.log"
         )
 
@@ -405,7 +406,7 @@ class TestNothingRanYet:
         only_these_profiles(target, other)
 
         context = adapter.adopt_loader_root(detect_framework(game), target)
-        result = diagnose_empty_log(context, adapter, None)
+        result = diagnose_silence(context, adapter, None)
 
         assert result["reason"] == OTHER_LOADER_RAN_LATER
 
@@ -429,3 +430,95 @@ class TestNothingRanYet:
         assert result["content"]
         assert "diagnosis" not in result
         assert result["log_written_at"]
+
+
+class TestStaleContent:
+    """A log that has not been written since the deploy.
+
+    This is the shape the feature originally missed. Gating the diagnosis on
+    an empty read only works while the agent polls with a cursor; after a
+    redeploy it reasonably reads afresh, gets the full tail of a log written
+    before the build it just made, and sees a wall of plausible text. Nothing
+    in the response contradicted it, so the only way out was to leave the tool
+    entirely and compare file times by hand.
+    """
+
+    @pytest.fixture()
+    def project(self, fake_game, profile, tmp_path, only_these_profiles):
+        def _build(*others, **profile_kwargs):
+            game = fake_game("Game")
+            target = profile("target", **profile_kwargs)
+            only_these_profiles(target, *others)
+            path = tmp_path / "proj"
+            path.mkdir(exist_ok=True)
+            ProjectConfig(
+                "MyMod", "bepinex5", str(game), "Game", deploy_root=str(target)
+            ).save(path)
+            return path, target
+
+        return _build
+
+    def test_content_older_than_the_deploy_is_still_diagnosed(self, project):
+        path, target = project(log=True, disk_logging=True)
+        _age(target / "BepInEx" / "LogOutput.log", seconds=86400)
+        _deploy(target)
+
+        result = server.watch_mod_logs(str(path))
+
+        # The text is right there and reads like any other session.
+        assert result["content"]
+        assert result["diagnosis"]["reason"] == NOTHING_RAN_SINCE_DEPLOY
+
+    def test_the_wrong_profile_is_caught_without_a_cursor(
+        self, project, profile
+    ):
+        """The rehearsal's actual failure: relaunched into another profile,
+        read the target fresh, and got its stale tail back with no warning."""
+        other = profile("other", log=True, disk_logging=True)
+        path, target = project(other, log=True, disk_logging=True)
+        _age(target / "BepInEx" / "LogOutput.log", seconds=86400)
+        _deploy(target, age_days=1)  # built yesterday; `other` ran since
+
+        result = server.watch_mod_logs(str(path))
+
+        assert result["diagnosis"]["reason"] == OTHER_LOADER_RAN_LATER
+        assert result["diagnosis"]["more_recent_loader"]["path"] == str(other)
+
+    def test_a_log_written_since_the_deploy_is_left_alone(
+        self, project, monkeypatch
+    ):
+        """The gate still holds with a deploy in place. This is the poll an
+        agent runs in a loop, and discovery is the expensive half of it."""
+        path, target = project(log=True, disk_logging=True)
+        _deploy(target, age_days=1)  # the log is the newer of the two
+
+        def _fail():
+            raise AssertionError("discovery ran on a log written since deploy")
+
+        monkeypatch.setattr("modwright.diagnosis.discover_profiles", _fail)
+        result = server.watch_mod_logs(str(path))
+
+        assert result["content"]
+        assert "diagnosis" not in result
+
+    def test_both_timestamps_ride_on_every_read(self, project):
+        """One timestamp answers nothing on its own -- the agent needs
+        something to compare it against, in the same payload."""
+        path, target = project(log=True, disk_logging=True)
+        _deploy(target)
+
+        result = server.watch_mod_logs(str(path))
+
+        assert result["log_written_at"]
+        assert result["deployed_at"]
+
+    def test_an_undeployed_project_reports_no_deploy_time(self, project):
+        """Absence means "not known", never a second fact encoded as a
+        timestamp. With nothing deployed there is no moment to rank against,
+        so the staleness check must not fire at all."""
+        path, _ = project(log=True, disk_logging=True)
+
+        result = server.watch_mod_logs(str(path))
+
+        assert result["deployed_at"] is None
+        assert "diagnosis" not in result
