@@ -592,6 +592,10 @@ def list_available_mods(project_path: str) -> dict[str, Any]:
     another -- a networking library, a shared API -- compiles against the copy
     already installed in the deploy target, so it matches the version the game
     will actually load and nothing has to be downloaded or copied.
+
+    `assemblies` are full paths, so they can be handed straight to a decompiler
+    to read what another mod actually does -- which is how a conflict over a
+    shared field gets diagnosed.
     """
     context, _, config = _context_for_project(Path(project_path))
     if context.mods_dir is None:
@@ -605,7 +609,13 @@ def list_available_mods(project_path: str) -> dict[str, Any]:
                 "package": mod.package,
                 "name": mod.display_name,
                 "version": mod.version,
-                "assemblies": [a.name for a in mod.assemblies],
+                # Paths, not bare filenames. This listing already holds them,
+                # and the caller's next step is usually to open one -- reading
+                # what an installed mod does is the only way to explain it
+                # fighting the mod under development. Reporting the name alone
+                # sent an agent to a shell to search for a file this function
+                # had in its hand.
+                "assemblies": [str(a) for a in mod.assemblies],
                 "referenceable": mod.referenceable,
             }
             for mod in _installed_dependencies(context, config)

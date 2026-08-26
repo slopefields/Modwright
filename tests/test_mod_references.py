@@ -328,6 +328,33 @@ class TestTools:
         assert by_package["a-Lib"]["referenceable"]
         assert not by_package["a-Native"]["referenceable"]
 
+    def test_the_listing_gives_openable_paths_not_bare_filenames(
+        self, project, installed_mod
+    ):
+        """Explaining why an installed mod fights the one being written means
+        reading its code, and a decompiler needs a path. This function already
+        holds them, so reporting the filename alone only sends the caller off
+        to search the disk for a file it could have handed over."""
+        path, context = project
+        installed_mod(context.mods_dir, "a-Lib", {"Lib.dll": "managed"})
+
+        listed = server.list_available_mods(str(path))["mods"][0]
+
+        assert listed["assemblies"] == [str(context.mods_dir / "a-Lib" / "Lib.dll")]
+
+    def test_the_two_tools_report_assemblies_the_same_way(
+        self, project, installed_mod
+    ):
+        """`add_mod_reference` always reported paths. The listing disagreeing
+        with it is the kind of split that teaches a caller to distrust both."""
+        path, context = project
+        installed_mod(context.mods_dir, "a-Lib", {"Lib.dll": "managed"})
+
+        listed = server.list_available_mods(str(path))["mods"][0]["assemblies"]
+        referenced = server.add_mod_reference(str(path), "a-Lib")["referenced"]
+
+        assert listed == referenced
+
 
 class TestVersionDrift:
     """A dependency updating underneath you should be reported, not inferred
