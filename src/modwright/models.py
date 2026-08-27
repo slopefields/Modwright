@@ -167,3 +167,12 @@ class LogRead:
     content: str
     cursor: int
     path: Path
+    #: The log was shorter than the cursor it was read from, so it was
+    #: truncated between the two reads. Loaders truncate their log when they
+    #: start, which makes this positive evidence that a NEW process began --
+    #: the one thing a timestamp cannot establish, since a process that was
+    #: already running keeps appending to the same file after a redeploy.
+    #:
+    #: False means only "not seen": a log that has already regrown past the
+    #: old cursor was truncated without leaving a shorter file behind.
+    restarted: bool = False

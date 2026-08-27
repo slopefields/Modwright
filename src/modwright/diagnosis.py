@@ -1,4 +1,4 @@
-"""Explaining an empty mod log.
+"""Explaining a log that shows no sign of the build that was just deployed.
 
 A mod deployed into a loader the player never launches produces no error
 anywhere: the build compiles, the copy succeeds, every step reports success,
@@ -8,8 +8,16 @@ to diagnose from its symptom, because the symptom is silence.
 This module turns that silence into evidence. It runs when a log read came
 back empty, and when the log has not been written since the mod was deployed
 -- stale content is silence too, and looks identical to a live session from
-the text alone. It stays off the hot path otherwise: a log written after the
-deploy *proves* the loader ran, and there is nothing left to explain.
+the text alone.
+
+A busy log is the third face of the same failure, and the one that took
+longest to see. A mod assembly is loaded once, when the game process starts.
+A game left running through a redeploy keeps writing to the same log with the
+PREVIOUS build in memory, so fresh content proves the loader is running and
+says nothing about which build it is running. This module used to state the
+opposite outright -- that a log written after the deploy proved the loader had
+picked the deploy up -- and every tool response agreed the deploy had landed
+while the game ran month-old code. `NO_RESTART_SINCE_LAST_READ` is that case.
 
 Two rules shape everything here:
 
@@ -54,6 +62,13 @@ OTHER_LOADER_RAN_LATER = "other_loader_ran_later"
 #: and it is still empty. Named for what was seen rather than "failed": the
 #: loader may have died before writing, or may never have been launched here.
 LOADER_WROTE_NOTHING = "loader_wrote_nothing"
+#: The log grew, but nothing in the new bytes shows the loader starting up and
+#: the file was never truncated -- so the process writing them was already
+#: running at the previous read. Named for the observation because its weight
+#: depends entirely on WHERE that previous read was taken: at the deploy it
+#: means the running game still holds the old build, and mid-session it means
+#: nothing at all.
+NO_RESTART_SINCE_LAST_READ = "no_restart_since_last_read"
 
 _ASK_DONT_SWITCH = (
     "Ask the user which profile they launched -- do not switch the deploy "
@@ -169,6 +184,47 @@ def diagnose_silence(
             "on their first run -- so it may never have been launched at all."
         )
     return _payload(LOADER_WROTE_NOTHING, target_root, hints=hints)
+
+
+def diagnose_no_restart(context: GameContext, target_log: Path) -> dict[str, Any]:
+    """Report that the log grew without the loader having started up in it.
+
+    Deliberately states only that, and hands the agent the one fact it needs
+    to weigh it: where its previous cursor came from. `deploy_mod` hands back
+    a cursor taken the moment the file was placed, and a poll from THAT cursor
+    turns this into a hard result -- no startup since the deploy means the
+    running process cannot be running the deployed build. A poll from a cursor
+    taken mid-session means nothing more than that the game is still up.
+
+    The tool cannot tell those apart: a cursor is a byte offset with no
+    timestamp on it, and there is nothing in a loader log to date a process
+    start against -- BepInEx's banner carries the game executable's date, the
+    same value in every profile on the machine. So the ambiguity is stated
+    rather than guessed at, as with every other reason in this module.
+    """
+    payload = _payload(
+        NO_RESTART_SINCE_LAST_READ,
+        context.effective_loader_root,
+        hints=[
+            "The log has been written to since the last read, but none of the "
+            "new content shows the loader starting up and the file was never "
+            "truncated -- so the process that wrote it was already running "
+            "then. It is the same game session as before, not a new one.",
+            "This is decisive ONLY if that cursor came from deploy_mod, which "
+            "returns the cursor as of the moment the file was placed. In that "
+            "case the running game loaded the previous build and cannot pick "
+            "this one up: mod assemblies are read once at process start. Have "
+            "the user fully quit and relaunch, then poll again.",
+            "If the restart was already seen on an earlier poll, this is "
+            "simply an ongoing session and there is nothing to act on.",
+            "Do not treat 'the game is open' as a relaunch, and do not take "
+            "it on trust -- a menu-level exit and a missed kill both leave the "
+            "original process alive and appending to this same log.",
+        ],
+    )
+    payload["log_path"] = str(target_log)
+    payload["deployed_at"] = _isoformat(last_deployed(context))
+    return payload
 
 
 def _most_recent_other_loader(

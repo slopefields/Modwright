@@ -70,3 +70,29 @@ def test_partial_leading_line_is_dropped_on_windowed_read(log_file):
     path = log_file("x" * 300_000 + "\ncomplete line\n")
     result = read_since(path, lines=10)
     assert not result.content.startswith("x")
+
+
+class TestRestartReporting:
+    """A truncated log is the loader having started again, and the caller has
+    no other way to learn it: nothing in a loader log is stamped with the
+    process start time."""
+
+    def test_truncation_is_reported_not_just_absorbed(self, log_file):
+        path = log_file("a long previous session\n" * 20)
+        stale = read_since(path).cursor
+
+        path.write_text("fresh session\n", encoding="utf-8")
+        assert read_since(path, since_cursor=stale).restarted is True
+
+    def test_a_log_that_only_grew_did_not_restart(self, log_file):
+        path = log_file("first\n")
+        first = read_since(path)
+
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write("second\n")
+
+        assert read_since(path, since_cursor=first.cursor).restarted is False
+
+    def test_first_read_has_no_baseline_to_have_restarted_since(self, log_file):
+        path = log_file("whatever\n")
+        assert read_since(path).restarted is False

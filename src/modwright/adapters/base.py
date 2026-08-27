@@ -179,6 +179,28 @@ class ModFrameworkAdapter(Protocol):
         """Return the log file to read now, or None if none exists yet."""
         ...
 
+    def count_loader_starts(self, log_text: str) -> int:
+        """Count the loader's own startup banner in a chunk of log text.
+
+        Answers "did a new game process begin" for a caller that only has a
+        slice of the log. A mod assembly is loaded once when the process
+        starts, so after a redeploy the question is never "was the log
+        written" -- a game left running answers that with the OLD build still
+        in memory -- but "did it start again since".
+
+        Takes text rather than a path deliberately. The count is only
+        meaningful over content read since a known point: BepInEx truncates
+        its log on startup, so counting the whole file returns 1 on every
+        profile on the machine whether it restarted or not. Passing a slice
+        makes that misuse awkward to write.
+
+        Must not raise, and 0 must mean "none in this text", never "cannot
+        tell" -- an adapter whose loader prints no such banner should say so
+        by returning 0 for everything, since the caller treats absence as
+        "not observed" rather than as proof of anything.
+        """
+        ...
+
     def inspect_logging(self, loader_root: Path) -> LoggingStatus:
         """Report whether this loader tree would write a log if it ran.
 

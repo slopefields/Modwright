@@ -197,3 +197,40 @@ class TestTheContractIsEnforced:
         assert "inspect_logging" in members  # a method
         assert "framework_id" in members  # an annotated attribute
         assert not any(name.startswith("_") for name in members)
+
+
+class TestLoaderStartCounting:
+    """Counting BepInEx's startup banner, and why it only works on a slice.
+
+    This is the adapter half of "is the running game running the build I just
+    deployed". The framework detail that makes it work is also the one that
+    makes the obvious use of it wrong.
+    """
+
+    def test_counts_the_startup_banner(self):
+        adapter = BepInEx5Adapter()
+        text = (
+            "[Message:   BepInEx] Preloader started\n"
+            "[Message:   BepInEx] Chainloader started\n"
+            "[Info   :   BepInEx] Loading [MyMod 1.0.0]\n"
+        )
+
+        assert adapter.count_loader_starts(text) == 1
+
+    def test_ordinary_output_counts_nothing(self):
+        assert BepInEx5Adapter().count_loader_starts("[Info: MyMod] hello\n") == 0
+
+    def test_empty_text_counts_nothing(self):
+        assert BepInEx5Adapter().count_loader_starts("") == 0
+
+    def test_the_version_banner_is_not_used_as_the_marker(self):
+        """BepInEx's first line looks like a launch timestamp and is not one --
+        it carries the game executable's date, so it reads identically in every
+        profile on a machine, months apart. Counting it would report a restart
+        on every single read."""
+        first_line = (
+            "[Message:   BepInEx] BepInEx 5.4.23.5 - Lethal Company "
+            "(8/22/2026 4:40:30 PM)\n"
+        )
+
+        assert BepInEx5Adapter().count_loader_starts(first_line) == 0

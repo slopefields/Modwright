@@ -21,6 +21,7 @@ from modwright import server
 from modwright.adapters import detect_framework
 from modwright.adapters.bepinex5 import BepInEx5Adapter
 from modwright.diagnosis import (
+    NO_RESTART_SINCE_LAST_READ,
     NOTHING_RAN_SINCE_DEPLOY,
     LOADER_WROTE_NOTHING,
     LOGGING_DISABLED,
@@ -522,3 +523,123 @@ class TestStaleContent:
 
         assert result["deployed_at"] is None
         assert "diagnosis" not in result
+
+
+class TestRestartDetection:
+    """Whether the running game is running the build that was just deployed.
+
+    The third face of the silent-deploy failure, and the one that survived the
+    first two fixes. A mod assembly is loaded once, when the process starts.
+    A game left open through a redeploy keeps appending to the same log with
+    the PREVIOUS build in memory, so the log is fresh, newer than the deploy,
+    full of plausible text -- and every check the tool had said yes while the
+    game ran the old code.
+
+    Nothing in a loader log dates a process start (BepInEx's banner carries the
+    game executable's date, identical in every profile on a machine), so this
+    can only be answered against a previous cursor.
+    """
+
+    @pytest.fixture()
+    def project(self, fake_game, profile, tmp_path, only_these_profiles):
+        def _build(**profile_kwargs):
+            game = fake_game("Game")
+            target = profile("target", log=True, disk_logging=True, **profile_kwargs)
+            only_these_profiles(target)
+            path = tmp_path / "restart-proj"
+            path.mkdir(exist_ok=True)
+            ProjectConfig(
+                "MyMod", "bepinex5", str(game), "Game", deploy_root=str(target)
+            ).save(path)
+            return path, target / "BepInEx" / "LogOutput.log"
+
+        return _build
+
+    def _append(self, log, text: str) -> None:
+        with log.open("a", encoding="utf-8") as handle:
+            handle.write(text)
+
+    def test_a_growing_log_with_no_startup_in_it_is_the_same_session(
+        self, project
+    ):
+        """The rehearsal's failure exactly: deploy, believe a relaunch
+        happened, poll, and read fresh output from the process that was
+        already running."""
+        path, log = project()
+        cursor = server.watch_mod_logs(str(path))["cursor"]
+        _deploy(log.parent.parent)
+        self._append(log, "[Info: MyMod] still the old build talking\n")
+
+        result = server.watch_mod_logs(str(path), since_cursor=cursor)
+
+        assert result["content"]  # plenty to read, and none of it proves a thing
+        assert result["loader_restarted_since_cursor"] is False
+        assert result["diagnosis"]["reason"] == NO_RESTART_SINCE_LAST_READ
+
+    def test_a_startup_banner_in_the_new_content_settles_it(self, project):
+        path, log = project()
+        cursor = server.watch_mod_logs(str(path))["cursor"]
+        _deploy(log.parent.parent)
+        self._append(log, "[Message: BepInEx] Chainloader started\n")
+
+        result = server.watch_mod_logs(str(path), since_cursor=cursor)
+
+        assert result["loader_restarted_since_cursor"] is True
+        assert "diagnosis" not in result
+
+    def test_a_truncated_log_settles_it_too(self, project):
+        """The signal the user found by hand: BepInEx truncates on startup, so
+        the banner can end up before a stale cursor rather than after it."""
+        path, log = project()
+        _deploy(log.parent.parent)
+        self._append(log, "a long previous session\n" * 40)
+        cursor = server.watch_mod_logs(str(path))["cursor"]
+
+        log.write_text("fresh, and shorter\n", encoding="utf-8")
+        result = server.watch_mod_logs(str(path), since_cursor=cursor)
+
+        assert result["loader_restarted_since_cursor"] is True
+        assert "diagnosis" not in result
+
+    def test_a_read_with_no_cursor_claims_nothing(self, project):
+        """Absence means "not known". The first read of a session is the
+        baseline -- there is nothing behind it to have restarted since, and
+        reporting False would read as a positive finding."""
+        path, log = project()
+        _deploy(log.parent.parent)
+        self._append(log, "written since the deploy\n")
+
+        result = server.watch_mod_logs(str(path))
+
+        assert result["loader_restarted_since_cursor"] is None
+        assert "diagnosis" not in result
+
+    def test_silence_is_diagnosed_ahead_of_the_restart_check(self, project):
+        """A log that has not been written since the deploy has a better
+        explanation available, and the profile scan can name it."""
+        path, log = project()
+        cursor = server.watch_mod_logs(str(path))["cursor"]
+        _age(log, seconds=86400)
+        _deploy(log.parent.parent)
+
+        result = server.watch_mod_logs(str(path), since_cursor=cursor)
+
+        assert result["diagnosis"]["reason"] == NOTHING_RAN_SINCE_DEPLOY
+
+    def test_the_hint_says_the_verdict_depends_on_where_the_cursor_came_from(
+        self, project
+    ):
+        """False here means "not seen", not "did not happen" -- it is decisive
+        only from a deploy-time cursor. Stating that is the whole point: the
+        alternative is an agent treating a mid-session poll as a fault."""
+        path, log = project()
+        cursor = server.watch_mod_logs(str(path))["cursor"]
+        _deploy(log.parent.parent)
+        self._append(log, "more output\n")
+
+        hints = " ".join(
+            server.watch_mod_logs(str(path), since_cursor=cursor)["diagnosis"]["hints"]
+        )
+
+        assert "deploy_mod" in hints
+        assert "relaunch" in hints

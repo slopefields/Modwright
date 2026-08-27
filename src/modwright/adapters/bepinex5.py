@@ -703,6 +703,23 @@ class BepInEx5Adapter:
         log_path = root / "BepInEx" / "LogOutput.log"
         return log_path if log_path.exists() else None
 
+    #: Printed once per process, immediately before BepInEx loads plugins.
+    #: Chosen over the version banner on the first line because that banner
+    #: carries the GAME EXECUTABLE's date, not the launch time -- it reads
+    #: identically in every profile on a machine, months apart, and is
+    #: therefore worthless as a "did it start again" signal despite looking
+    #: exactly like a timestamp.
+    _CHAINLOADER_BANNER = "Chainloader started"
+
+    def count_loader_starts(self, log_text: str) -> int:
+        """How many times BepInEx began loading plugins in this text.
+
+        Only ever meaningful over a slice read since a known cursor. BepInEx
+        truncates LogOutput.log when it starts, so the whole file holds
+        exactly one of these no matter how many times the game has been run.
+        """
+        return log_text.count(self._CHAINLOADER_BANNER)
+
     def inspect_logging(self, loader_root: Path) -> LoggingStatus:
         config_path = loader_root / "BepInEx" / "config" / "BepInEx.cfg"
         if not config_path.is_file():

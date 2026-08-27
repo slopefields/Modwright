@@ -643,3 +643,56 @@ class TestPatchNamesCheckedOnTheWayThrough:
 
         assert result["success"] is False
         assert result["code"] == "build_failed"
+
+
+class TestDeployHandsBackALogCursor:
+    """Deploy is the only moment the tool knows for certain, so it is the
+    only place a useful baseline can be taken.
+
+    Everything downstream -- did the game restart, is the running process
+    holding this build -- is answered relative to a cursor. Left to take its
+    own baseline on the first poll, the agent takes it after the relaunch it
+    is trying to detect, and there is nothing left to compare.
+    """
+
+    @pytest.fixture()
+    def deployable(self, project, monkeypatch):
+        async def _no_patches(project_path, context, adapter):
+            return {"valid": True, "checked": 0, "missing": [],
+                    "found": [], "unchecked": []}
+
+        monkeypatch.setattr(server, "_validate_patches", _no_patches)
+        _stub_build(monkeypatch)
+        path, context = project
+        return path, context.install_root / "BepInEx" / "LogOutput.log"
+
+    def test_the_cursor_is_the_logs_length_at_deploy_time(self, deployable):
+        path, log = deployable
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text("previous session\n", encoding="utf-8")
+
+        result = asyncio.run(server.deploy_mod(str(path)))
+
+        assert result["log_cursor"] == log.stat().st_size
+
+    def test_a_profile_never_launched_reports_no_cursor(self, deployable):
+        """None rather than 0: there is no log yet, and reading from byte 0 of
+        the one first launch writes covers the startup anyway."""
+        path, log = deployable
+        assert not log.exists()
+
+        assert asyncio.run(server.deploy_mod(str(path)))["log_cursor"] is None
+
+    def test_polling_from_that_cursor_sees_the_next_startup(self, deployable):
+        """The whole point, end to end: the bytes after the deploy cursor are
+        exactly the ones written since the file was placed."""
+        path, log = deployable
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text("previous session\n", encoding="utf-8")
+        cursor = asyncio.run(server.deploy_mod(str(path)))["log_cursor"]
+
+        with log.open("a", encoding="utf-8") as handle:
+            handle.write("[Message:   BepInEx] Chainloader started\n")
+
+        polled = server.watch_mod_logs(str(path), since_cursor=cursor)
+        assert polled["loader_restarted_since_cursor"] is True

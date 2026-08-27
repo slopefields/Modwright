@@ -17,7 +17,12 @@ from typing import Any, Callable
 from mcp.server import MCPServer
 
 from modwright.adapters import detect_framework, get_adapter
-from modwright.diagnosis import diagnose_silence, last_deployed, mtime_of
+from modwright.diagnosis import (
+    diagnose_no_restart,
+    diagnose_silence,
+    last_deployed,
+    mtime_of,
+)
 from modwright.errors import (
     BuildFailedError,
     DecompilerUnavailableError,
@@ -27,8 +32,8 @@ from modwright.errors import (
     ModwrightError,
 )
 from modwright.logs import read_since
+from modwright.models import BuildOutcome, GameContext, LogRead
 from modwright.mods import find_installed_mod, list_installed_mods
-from modwright.models import BuildOutcome, GameContext
 from modwright.profiles import discover_incomplete_profiles, discover_profiles
 from modwright.project_config import ModReference, ProjectConfig
 from modwright.validation import validate_targets
@@ -809,6 +814,13 @@ async def deploy_mod(project_path: str) -> dict[str, Any]:
     Builds rather than copying whatever is already there, so what runs in the
     game always matches the source on disk. Reports `patches_checked` the same
     way `build_mod` does, since this is the last step before a launch.
+
+    Also returns `log_cursor`: the log's length at the moment the file was
+    placed. Pass it to `watch_mod_logs` as `since_cursor` on the next poll and
+    keep passing it until the loader is seen starting up. That is the only way
+    to establish that the running game is running THIS build -- a mod assembly
+    is loaded once at process start, so a game left open through the deploy
+    keeps writing to its log with the previous build still in memory.
     """
     context, adapter, config = _context_for_project(Path(project_path))
     _require_chosen_target(context, adapter, config)
@@ -821,8 +833,27 @@ async def deploy_mod(project_path: str) -> dict[str, Any]:
         "destination": str(deployed.destination),
         "copied": deployed.copied,
         "deploy_root": config.deploy_root,
+        # Read after the copy, so the cursor cannot land mid-write and hide
+        # the startup that a later poll needs to find.
+        "log_cursor": _log_length(adapter, context),
         **checked,
     }
+
+
+def _log_length(adapter: Any, context: GameContext) -> int | None:
+    """The target log's current length, or None if there is no log yet.
+
+    None is a usable answer rather than a failure: a profile that has never
+    been launched has no log, and reading from byte 0 of the one it writes on
+    first launch covers the startup either way.
+    """
+    log_path = adapter.resolve_log(context)
+    if log_path is None:
+        return None
+    try:
+        return log_path.stat().st_size
+    except OSError:
+        return None
 
 
 @mcp.tool()
@@ -840,12 +871,21 @@ def watch_mod_logs(
     trusting the content: a log older than the deploy holds only text from
     before this build existed, which reads exactly like a live session.
 
-    A `diagnosis` explains the silence whenever there is silence to explain --
-    nothing new to read, or nothing written since the deploy. Most often the
-    game was launched through a different loader than the one this mod deploys
-    into, which otherwise fails completely silently. Its `reason` reports what
-    was observed, not what caused it: ask the user before acting on it, since
-    the likeliest fixes are opposites.
+    A log NEWER than the deploy is not the all-clear it looks like, which is
+    why every read also reports `loader_restarted_since_cursor`. Mod assemblies
+    are loaded once when the game process starts, so a game left running
+    through a redeploy goes on writing to the same log with the previous build
+    in memory -- fresh content and all. Only a loader startup seen in the new
+    content, or a truncated log, shows a new process. Poll from the
+    `log_cursor` that `deploy_mod` returns and keep polling from it until this
+    turns true; `null` means the read had no cursor to compare against.
+
+    A `diagnosis` explains anything that does not add up -- nothing new to
+    read, nothing written since the deploy, or content with no restart behind
+    it. Most often the game was launched through a different loader than the
+    one this mod deploys into, which otherwise fails completely silently. Its
+    `reason` reports what was observed, not what caused it: ask the user
+    before acting on it, since the likeliest fixes are opposites.
     """
     context, adapter, _ = _context_for_project(Path(project_path))
     log_path = adapter.resolve_log(context)
@@ -867,6 +907,7 @@ def watch_mod_logs(
     # not settle it either -- there has to be something to compare it against.
     log_written_at = mtime_of(log_path)
     deployed_at = last_deployed(context)
+    restarted = _restarted_since_cursor(read, adapter, since_cursor)
     response = {
         "success": True,
         "log_path": str(read.path),
@@ -874,6 +915,7 @@ def watch_mod_logs(
         "content": read.content,
         "log_written_at": _isoformat(log_written_at),
         "deployed_at": _isoformat(deployed_at),
+        "loader_restarted_since_cursor": restarted,
     }
 
     # Stale content is silence too. Gating on an empty read alone missed the
@@ -884,11 +926,41 @@ def watch_mod_logs(
         log_written_at is None or log_written_at < deployed_at
     )
     if not read.content or stale:
-        # Still gated. A log written since the deploy proves this loader ran,
-        # which settles the question outright -- and this is the one tool an
-        # agent polls in a loop, so the profile scan must stay off that path.
+        # Still gated on silence: this is the one tool an agent polls in a
+        # loop, and the profile scan behind this diagnosis must stay off that
+        # path. Content written since the deploy proves the loader is running,
+        # which is all the scan could have established anyway.
         response["diagnosis"] = diagnose_silence(context, adapter, log_path)
+    elif restarted is False:
+        # It does NOT prove the loader started since the deploy, though, and
+        # that is the question a redeploy actually asks. Cheap by comparison:
+        # no scan, only what this read already saw.
+        response["diagnosis"] = diagnose_no_restart(context, log_path)
     return response
+
+
+def _restarted_since_cursor(
+    read: LogRead, adapter: Any, since_cursor: int | None
+) -> bool | None:
+    """Whether a new game process began since the cursor was handed out.
+
+    None when there was no cursor: the first read of a session establishes the
+    baseline and has nothing behind it to have restarted since.
+
+    Two independent signals, either of which is proof. The loader truncated
+    its log, which loaders do on startup; or its startup banner appears in the
+    bytes just read. Both are needed -- a log truncated and then regrown past
+    the old cursor leaves no short file to catch, and a cursor already sitting
+    past the banner leaves no banner to find.
+
+    False therefore means "neither was seen", not "definitely did not happen",
+    and the diagnosis it triggers is worded that way. That is the safe
+    direction to be wrong in: it asks for a relaunch that already happened,
+    where the old behaviour blessed a game running last week's build.
+    """
+    if since_cursor is None:
+        return None
+    return read.restarted or adapter.count_loader_starts(read.content) > 0
 
 
 def main() -> None:
