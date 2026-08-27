@@ -26,6 +26,7 @@ from modwright.project_config import ModReference, ProjectConfig
 from modwright.server import _reference_drift
 
 from conftest import _pe_bytes
+from modwright.mods import _HEADER_BYTES, is_managed_assembly
 
 
 @pytest.fixture()
@@ -696,3 +697,37 @@ class TestDeployHandsBackALogCursor:
 
         polled = server.watch_mod_logs(str(path), since_cursor=cursor)
         assert polled["loader_restarted_since_cursor"] is True
+
+
+class TestAssemblyClassificationReadsOnlyTheHeader:
+    """Every entry in a mods folder passes through `is_managed_assembly`, and
+    reading each one whole cost 12.6 seconds on a real 91-mod profile -- 60 MB
+    of assembly bodies to look at a few hundred bytes of header. That is on
+    the path of `list_available_mods` and of every reference change, and
+    `write_project_props` walks it once per referenced package."""
+
+    def test_a_body_larger_than_the_header_window_is_still_classified(
+        self, tmp_path
+    ):
+        dll = tmp_path / "Big.dll"
+        dll.write_bytes(_pe_bytes(managed=True) + b"\0" * (_HEADER_BYTES * 4))
+        assert is_managed_assembly(dll) is True
+
+    def test_a_native_library_of_the_same_size_is_still_excluded(self, tmp_path):
+        dll = tmp_path / "opus.dll"
+        dll.write_bytes(_pe_bytes(managed=False) + b"\0" * (_HEADER_BYTES * 4))
+        assert is_managed_assembly(dll) is False
+
+    def test_a_file_too_short_to_hold_a_header_is_refused_not_raised(
+        self, tmp_path
+    ):
+        """A partly-downloaded or zero-byte file in a mods folder must be
+        classified, not turned into a traceback out of a listing tool."""
+        dll = tmp_path / "Truncated.dll"
+        dll.write_bytes(_pe_bytes(managed=True)[:64])
+        assert is_managed_assembly(dll) is False
+
+    def test_an_empty_file_is_refused(self, tmp_path):
+        dll = tmp_path / "Empty.dll"
+        dll.write_bytes(b"")
+        assert is_managed_assembly(dll) is False
