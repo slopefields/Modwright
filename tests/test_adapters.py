@@ -7,6 +7,8 @@ is covered without those games being installed.
 from __future__ import annotations
 
 import errno
+import subprocess
+import sys
 
 import pytest
 
@@ -17,6 +19,7 @@ from modwright.adapters.registry import ADAPTERS, _protocol_members, _verify_ada
 from modwright.adapters.bepinex5 import BepInEx5Adapter
 from modwright.errors import (
     ArtifactLockedError,
+    BuildFailedError,
     DeployFailedError,
     Il2CppUnsupportedError,
     InvalidInstallRootError,
@@ -292,3 +295,129 @@ class TestDeployFailuresAreNamedForWhatHappened:
             adapter.deploy(outcome, context)
 
         assert not any("running" in hint for hint in caught.value.hints)
+
+
+class TestABuildThatStalls:
+    """A build that FAILS needs none of this: it exits non-zero in seconds and
+    its compiler errors are the answer. This is for one that never exits at
+    all -- an MCP server cannot be interrupted mid-tool-call, so it takes the
+    whole session with it.
+
+    The rule these pin down is that SILENCE is the signal, not elapsed time.
+    `dotnet` narrates while it works, so a long build and a stuck one are not
+    told apart by a clock."""
+
+    @pytest.fixture()
+    def fake_dotnet(self, monkeypatch):
+        """Run a Python snippet wherever the adapter would run `dotnet`."""
+
+        def _install(script: str):
+            real = subprocess.Popen
+
+            def launch(command, **kwargs):
+                return real([sys.executable, "-u", "-c", script], **kwargs)
+
+            monkeypatch.setattr(bepinex5.subprocess, "Popen", launch)
+
+        return _install
+
+    @pytest.fixture()
+    def impatient(self, monkeypatch):
+        """Shrink both limits so the real mechanism can be tested in a second."""
+        monkeypatch.setattr(bepinex5, "_QUIET_TIMEOUT_SECONDS", 0.4)
+        monkeypatch.setattr(bepinex5, "_BUILD_TIMEOUT_SECONDS", 5)
+
+    def test_a_silent_process_is_stopped(self, fake_dotnet, impatient):
+        fake_dotnet("import time; time.sleep(30)")
+
+        with pytest.raises(BuildFailedError) as caught:
+            BepInEx5Adapter()._run_dotnet(["build"])
+
+        assert "printed nothing" in str(caught.value)
+
+    def test_a_slow_build_that_keeps_talking_is_left_alone(
+        self, fake_dotnet, impatient
+    ):
+        """The whole point. This runs more than twice the quiet limit, and
+        must finish rather than be killed for taking a while."""
+        fake_dotnet(
+            "import time\n"
+            "for i in range(10):\n"
+            "    print('Restoring package', i)\n"
+            "    time.sleep(0.1)\n"
+        )
+
+        result = BepInEx5Adapter()._run_dotnet(["build"])
+
+        assert result.returncode == 0
+        assert "Restoring package 9" in result.stdout
+
+    def test_the_wall_clock_still_catches_a_process_that_only_spins(
+        self, fake_dotnet, monkeypatch
+    ):
+        """Talking forever is not working forever, so the backstop stays."""
+        monkeypatch.setattr(bepinex5, "_QUIET_TIMEOUT_SECONDS", 5)
+        monkeypatch.setattr(bepinex5, "_BUILD_TIMEOUT_SECONDS", 0.5)
+        fake_dotnet(
+            "import time\n"
+            "while True:\n"
+            "    print('still going')\n"
+            "    time.sleep(0.05)\n"
+        )
+
+        with pytest.raises(BuildFailedError) as caught:
+            BepInEx5Adapter()._run_dotnet(["build"])
+
+        assert "still running after" in str(caught.value)
+
+    def test_where_it_stopped_is_reported(self, fake_dotnet, impatient):
+        """An elapsed time says nothing. The last line says where it went."""
+        fake_dotnet(
+            "import time\n"
+            "print('Restoring packages for MyMod.csproj')\n"
+            "time.sleep(30)\n"
+        )
+
+        with pytest.raises(BuildFailedError) as caught:
+            BepInEx5Adapter()._run_dotnet(["build"])
+
+        assert any("Restoring packages for" in hint for hint in caught.value.hints)
+        assert caught.value.details["last_output"] == [
+            "Restoring packages for MyMod.csproj"
+        ]
+
+    def test_reading_stdin_ends_rather_than_hangs(self, fake_dotnet, impatient):
+        """This server speaks MCP over stdio. A child that inherits stdin is
+        both stuck forever and eating the protocol; with it closed, anything
+        that asks for input gets EOF and fails immediately instead."""
+        fake_dotnet("import sys; sys.stdin.read(); print('got input')")
+
+        result = BepInEx5Adapter()._run_dotnet(["build"])
+
+        assert result.returncode == 0
+        assert "got input" in result.stdout
+
+    def test_the_two_streams_are_not_merged(self, fake_dotnet, impatient):
+        """`-getProperty` returns the path this adapter parses on stdout, so a
+        stray MSBuild warning folded in with it would corrupt the deploy."""
+        fake_dotnet(
+            "import sys\n"
+            "print('C:/out/MyMod.dll')\n"
+            "print('warning: something', file=sys.stderr)\n"
+        )
+
+        result = BepInEx5Adapter()._run_dotnet(["msbuild"])
+
+        assert result.stdout.strip() == "C:/out/MyMod.dll"
+        assert "warning" in result.stderr
+
+    def test_a_missing_dotnet_is_still_named(self, monkeypatch):
+        def absent(*args, **kwargs):
+            raise FileNotFoundError("dotnet")
+
+        monkeypatch.setattr(bepinex5.subprocess, "Popen", absent)
+
+        with pytest.raises(BuildFailedError) as caught:
+            BepInEx5Adapter()._run_dotnet(["build"])
+
+        assert "not found" in str(caught.value)

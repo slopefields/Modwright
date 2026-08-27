@@ -12,8 +12,12 @@ import errno
 import re
 import shutil
 import subprocess
+import time
 from dataclasses import replace
 from pathlib import Path
+from queue import Empty, Queue
+from threading import Thread
+from typing import Any
 from xml.sax.saxutils import escape as xml_escape
 
 from modwright.errors import (
@@ -60,6 +64,80 @@ _VALID_MOD_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 #: other is what silently compiled mods against a different BepInEx from the
 #: one they ran under.
 PROPS_FILENAME = "Modwright.props"
+
+#: Ceiling on any one `dotnet` invocation, whatever it is printing. The
+#: backstop, not the main check: a build still narrating its progress is
+#: working, so this only catches one that spins without ever finishing.
+_BUILD_TIMEOUT_SECONDS = 600
+
+#: How long `dotnet` may print NOTHING before it is treated as stuck. This is
+#: the check that matters -- it separates a slow build from a stalled one,
+#: which elapsed time cannot. Deliberately generous: a large package download
+#: mid-restore is the longest legitimate quiet stretch, and killing a build
+#: that was about to succeed is a far worse answer than waiting.
+_QUIET_TIMEOUT_SECONDS = 180
+
+
+def _pump(handle: Any, sink: list[str], activity: "Queue[str | None]") -> None:
+    """Drain one pipe into `sink`, announcing every line as a sign of life.
+
+    A thread per pipe rather than one loop over both: `select` does not work
+    on pipes on Windows, and reading them in sequence would block on an idle
+    stdout while stderr was the one still talking.
+    """
+    try:
+        for line in handle:
+            sink.append(line)
+            activity.put(line)
+    finally:
+        activity.put(None)  # this pipe reached EOF
+
+
+def _wait_for_output(
+    process: "subprocess.Popen[str]", activity: "Queue[str | None]", args: list[str]
+) -> str | None:
+    """Wait for both pipes to close. Returns None, or why it gave up waiting."""
+    deadline = time.monotonic() + _BUILD_TIMEOUT_SECONDS
+    open_pipes = 2
+
+    while open_pipes:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return f"it was still running after {_BUILD_TIMEOUT_SECONDS}s"
+        try:
+            if activity.get(timeout=min(_QUIET_TIMEOUT_SECONDS, remaining)) is None:
+                open_pipes -= 1
+        except Empty:
+            # WHICH limit ran out has to be decided here, not assumed. The
+            # wait is the shorter of the two, so a process that talks steadily
+            # right up to the wall clock ends on an `Empty` as well -- and
+            # reporting that as silence would name a cause that was not what
+            # happened, which is the one thing this codebase will not do.
+            if time.monotonic() >= deadline:
+                return f"it was still running after {_BUILD_TIMEOUT_SECONDS}s"
+            return f"it printed nothing for {_QUIET_TIMEOUT_SECONDS}s"
+    return None
+
+
+def _stalled_error(
+    args: list[str], stalled: str, streams: dict[str, list[str]]
+) -> BuildFailedError:
+    """Say what was seen and where it stopped, not just that time ran out."""
+    last = [line.strip() for line in streams["stdout"][-5:] if line.strip()]
+    hints = [
+        "A first build restores NuGet packages and can be slow, but it keeps "
+        "printing while it works. Nothing was printed here, which points at "
+        "something waiting rather than something working -- an unreachable "
+        "package feed is the usual cause.",
+        "Run the same command in a terminal to see where it stops.",
+    ]
+    if last:
+        hints.insert(0, "Last output before it stopped: " + last[-1])
+    return BuildFailedError(
+        f"`dotnet {args[0]}` was stopped because {stalled}.",
+        hints=hints,
+        details={"last_output": last},
+    )
 
 
 def _is_locked(exc: OSError) -> bool:
@@ -569,10 +647,37 @@ class BepInEx5Adapter:
 
     @staticmethod
     def _run_dotnet(args: list[str]) -> subprocess.CompletedProcess[str]:
+        """Run `dotnet`, watching for silence rather than only for elapsed time.
+
+        A build that FAILS needs none of this: it exits non-zero in seconds and
+        its compiler errors are the answer. What this guards against is a build
+        that never exits at all, where an MCP server has no way to be
+        interrupted mid-tool-call and the whole session goes with it.
+
+        Two limits, because a long build and a stuck one are not told apart by
+        a clock. `dotnet` narrates constantly -- restore, per-project compile,
+        warnings -- so a working build is never quiet for long, and a stuck one
+        is quiet forever. Silence is the signal; the wall clock is only the
+        backstop for a process that spins while still printing.
+
+        Both report the last output before the stall, which is the part worth
+        reading: "stuck after: Restoring packages for ..." says where it went
+        wrong, where an elapsed-time message says nothing at all.
+        """
+        streams: dict[str, list[str]] = {"stdout": [], "stderr": []}
         try:
-            return subprocess.run(
+            process = subprocess.Popen(
                 ["dotnet", *args],
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                # Never the parent's stdin. This server speaks MCP over stdio,
+                # and a child that reads from it is both hung forever and
+                # eating the protocol. The SDK diverts fd 0 for exactly this
+                # reason, but documents that as best-effort -- and a tool that
+                # cannot wait for input cannot hang waiting for it, which
+                # turns a NuGet credential prompt on a private feed from a
+                # silent stall into an immediate error.
+                stdin=subprocess.DEVNULL,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
@@ -582,6 +687,30 @@ class BepInEx5Adapter:
                 "The `dotnet` command was not found.",
                 hints=["Install the .NET SDK and ensure `dotnet` is on PATH."],
             ) from exc
+
+        # Kept apart rather than merged into one pipe: `-getProperty` returns
+        # the value this adapter parses on stdout, and folding a stray MSBuild
+        # warning in with it would corrupt the path the build then deploys.
+        activity: Queue[str | None] = Queue()
+        for name, handle in (("stdout", process.stdout), ("stderr", process.stderr)):
+            Thread(
+                target=_pump,
+                args=(handle, streams[name], activity),
+                daemon=True,
+            ).start()
+
+        stalled = _wait_for_output(process, activity, args)
+        if stalled is not None:
+            process.kill()
+            process.wait()
+            raise _stalled_error(args, stalled, streams)
+
+        return subprocess.CompletedProcess(
+            args=["dotnet", *args],
+            returncode=process.wait(),
+            stdout="".join(streams["stdout"]),
+            stderr="".join(streams["stderr"]),
+        )
 
     def deploy(
         self, outcome: BuildOutcome, game_context: GameContext
