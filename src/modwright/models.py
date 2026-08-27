@@ -176,3 +176,15 @@ class LogRead:
     #: False means only "not seen": a log that has already regrown past the
     #: old cursor was truncated without leaving a shorter file behind.
     restarted: bool = False
+
+    #: Loader startups counted in everything that was read, BEFORE `content`
+    #: was trimmed to the caller's line budget. Counted there deliberately:
+    #: the startup banner sits at the top of a freshly truncated log, which is
+    #: the first thing a tail drops -- so trimming the text the agent sees
+    #: must not also blind the check for whether a new process began.
+    loader_starts: int = 0
+
+    #: Lines read but not returned, because `content` is capped. Reported
+    #: rather than dropped quietly: an agent that cannot tell a complete read
+    #: from a trimmed one will read a gap as evidence that nothing happened.
+    omitted_lines: int = 0

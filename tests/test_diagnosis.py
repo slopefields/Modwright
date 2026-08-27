@@ -643,3 +643,68 @@ class TestRestartDetection:
 
         assert "deploy_mod" in hints
         assert "relaunch" in hints
+
+
+class TestAPollIsBounded:
+    """`watch_mod_logs` is documented to be polled from the cursor `deploy_mod`
+    handed back, and to keep being polled from it until the loader is seen
+    starting. That region is a whole play session: on this machine's own
+    profiles it reaches a megabyte, which is a quarter of a million tokens in
+    one tool response."""
+
+    @pytest.fixture()
+    def project(self, fake_game, profile, tmp_path, only_these_profiles):
+        game = fake_game("Game")
+        target = profile("target", log=True, disk_logging=True)
+        only_these_profiles(target)
+        path = tmp_path / "proj"
+        path.mkdir(exist_ok=True)
+        ProjectConfig(
+            "MyMod", "bepinex5", str(game), "Game", deploy_root=str(target)
+        ).save(path)
+        _deploy(target)
+        return path, target / "BepInEx" / "LogOutput.log"
+
+    def test_a_long_session_does_not_come_back_whole(self, project):
+        path, log = project
+        log.write_text(
+            "Chainloader started\n" + "".join(f"line {i}\n" for i in range(20_000)),
+            encoding="utf-8",
+        )
+
+        result = server.watch_mod_logs(str(path), since_cursor=0, lines=20)
+
+        assert len(result["content"].splitlines()) == 20
+        assert result["omitted_lines"] == 19_981
+
+    def test_the_trim_is_stated_rather_than_left_to_be_noticed(self, project):
+        path, log = project
+        log.write_text("".join(f"line {i}\n" for i in range(500)), encoding="utf-8")
+
+        result = server.watch_mod_logs(str(path), since_cursor=0, lines=10)
+
+        assert any("not shown" in hint for hint in result["hints"])
+
+    def test_a_read_that_fits_says_nothing_about_omissions(self, project):
+        path, log = project
+        log.write_text("Chainloader started\nall of it\n", encoding="utf-8")
+
+        result = server.watch_mod_logs(str(path), since_cursor=0, lines=50)
+
+        assert "omitted_lines" not in result
+
+    def test_a_restart_buried_in_the_dropped_region_is_still_seen(self, project):
+        """The banner sits at the top of a freshly truncated log, so it is the
+        first thing a tail drops -- and dropping it would report the running
+        game as still holding the previous build."""
+        path, log = project
+        log.write_text(
+            "Chainloader started\n" + "".join(f"line {i}\n" for i in range(20_000)),
+            encoding="utf-8",
+        )
+
+        result = server.watch_mod_logs(str(path), since_cursor=0, lines=20)
+
+        assert "Chainloader started" not in result["content"]
+        assert result["loader_restarted_since_cursor"] is True
+        assert "diagnosis" not in result

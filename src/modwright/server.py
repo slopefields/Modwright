@@ -867,6 +867,11 @@ def watch_mod_logs(
     cursor while reproducing an issue in-game. An MCP server cannot push
     updates, so the agent drives the loop.
 
+    At most `lines` lines come back, from the end, whether or not a cursor was
+    given -- a session left running writes more than is worth reading, and one
+    of this machine's own profiles holds a megabyte of it. `omitted_lines`
+    says how many were dropped; nothing is dropped silently.
+
     Every read reports `log_written_at` and `deployed_at`. Compare them before
     trusting the content: a log older than the deploy holds only text from
     before this build existed, which reads exactly like a live session.
@@ -900,14 +905,22 @@ def watch_mod_logs(
             details={"diagnosis": diagnose_silence(context, adapter, None)},
         )
 
-    read = read_since(log_path, since_cursor=since_cursor, lines=lines)
+    read = read_since(
+        log_path,
+        since_cursor=since_cursor,
+        lines=lines,
+        # Scanned over the whole region read, not over the trimmed content:
+        # the startup banner sits at the top of a freshly truncated log, and
+        # the tail is exactly what drops it.
+        loader_starts=adapter.count_loader_starts,
+    )
     # Both on every read, not just empty ones. A read with no cursor returns
     # the tail of whatever is already there, which can be weeks old, and the
     # text alone cannot be told apart from a live session. One timestamp does
     # not settle it either -- there has to be something to compare it against.
     log_written_at = mtime_of(log_path)
     deployed_at = last_deployed(context)
-    restarted = _restarted_since_cursor(read, adapter, since_cursor)
+    restarted = _restarted_since_cursor(read, since_cursor)
     response = {
         "success": True,
         "log_path": str(read.path),
@@ -917,6 +930,19 @@ def watch_mod_logs(
         "deployed_at": _isoformat(deployed_at),
         "loader_restarted_since_cursor": restarted,
     }
+
+    # Said out loud, never left to be inferred from a short read. An agent
+    # given the tail of a session with no note that it IS a tail will read
+    # the missing lines as the loader having gone quiet.
+    if read.omitted_lines:
+        response["omitted_lines"] = read.omitted_lines
+        response["hints"] = [
+            f"{read.omitted_lines} earlier line(s) were written since this "
+            f"cursor and are not shown -- only the last {lines} are. Raise "
+            "`lines` for more, or open the log at `log_path` for all of it. "
+            "The restart check above still looked at every line, including "
+            "these.",
+        ]
 
     # Stale content is silence too. Gating on an empty read alone missed the
     # most common shape of this bug entirely: after a redeploy the agent reads
@@ -939,9 +965,7 @@ def watch_mod_logs(
     return response
 
 
-def _restarted_since_cursor(
-    read: LogRead, adapter: Any, since_cursor: int | None
-) -> bool | None:
+def _restarted_since_cursor(read: LogRead, since_cursor: int | None) -> bool | None:
     """Whether a new game process began since the cursor was handed out.
 
     None when there was no cursor: the first read of a session establishes the
@@ -960,7 +984,7 @@ def _restarted_since_cursor(
     """
     if since_cursor is None:
         return None
-    return read.restarted or adapter.count_loader_starts(read.content) > 0
+    return read.restarted or read.loader_starts > 0
 
 
 def main() -> None:
