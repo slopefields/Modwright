@@ -8,6 +8,7 @@ and Beat Saber's BSIPA all reuse it, differing only in where they look.
 
 from __future__ import annotations
 
+import errno
 import re
 import shutil
 import subprocess
@@ -18,6 +19,7 @@ from xml.sax.saxutils import escape as xml_escape
 from modwright.errors import (
     ArtifactLockedError,
     BuildFailedError,
+    DeployFailedError,
     Il2CppUnsupportedError,
     InvalidDeployRootError,
     InvalidModNameError,
@@ -58,6 +60,18 @@ _VALID_MOD_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 #: other is what silently compiled mods against a different BepInEx from the
 #: one they ran under.
 PROPS_FILENAME = "Modwright.props"
+
+
+def _is_locked(exc: OSError) -> bool:
+    """Whether this failure is another process holding the file open.
+
+    Windows reports it as a sharing or lock violation, which surfaces as
+    `winerror` rather than `errno`; POSIX has no direct equivalent, so an
+    ETXTBSY (the file is being executed) is the nearest thing.
+    """
+    if getattr(exc, "winerror", None) in {32, 33}:
+        return True
+    return exc.errno == errno.ETXTBSY
 
 _PROPS_IMPORT = (
     f'  <Import Project="{PROPS_FILENAME}" '
@@ -595,16 +609,29 @@ class BepInEx5Adapter:
 
         try:
             shutil.copy2(outcome.artifact, destination)
-        except (PermissionError, OSError) as exc:
+        except OSError as exc:
             # Windows raises a sharing violation (WinError 32) when the game
             # holds the DLL open. That is the overwhelmingly common cause, and
-            # a plain stack trace hides it.
-            raise ArtifactLockedError(
-                f"Could not write {destination.name}: the file is locked.",
+            # a plain stack trace hides it -- but it is not the ONLY cause, and
+            # every OSError used to be reported as it. A full disk telling the
+            # user to close a game they have already closed sends the whole
+            # investigation the wrong way, which is the failure mode this
+            # codebase keeps fighting: a confident answer that is not true.
+            if _is_locked(exc):
+                raise ArtifactLockedError(
+                    f"Could not write {destination.name}: the file is locked.",
+                    hints=[
+                        f"{game_context.game_name} is probably running -- close "
+                        "it and deploy again.",
+                        f"Underlying error: {exc}",
+                    ],
+                ) from exc
+            raise DeployFailedError(
+                f"Could not write {destination.name}: {exc}",
                 hints=[
-                    f"{game_context.game_name} is probably running -- close it "
-                    "and deploy again.",
-                    f"Underlying error: {exc}",
+                    f"The build succeeded; only the copy into {plugins_dir} "
+                    "failed, so this is about the destination rather than the "
+                    "mod. Check free space and that the path is writable.",
                 ],
             ) from exc
 

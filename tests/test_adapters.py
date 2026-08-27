@@ -6,17 +6,23 @@ is covered without those games being installed.
 
 from __future__ import annotations
 
+import errno
+
 import pytest
 
 from modwright.adapters import detect_framework
+from modwright.adapters import bepinex5
 from modwright.adapters.base import ModFrameworkAdapter
 from modwright.adapters.registry import ADAPTERS, _protocol_members, _verify_adapters
 from modwright.adapters.bepinex5 import BepInEx5Adapter
 from modwright.errors import (
+    ArtifactLockedError,
+    DeployFailedError,
     Il2CppUnsupportedError,
     InvalidInstallRootError,
     UnsupportedGameError,
 )
+from modwright.models import BuildOutcome
 
 
 class TestBepInEx5Detection:
@@ -234,3 +240,55 @@ class TestLoaderStartCounting:
         )
 
         assert BepInEx5Adapter().count_loader_starts(first_line) == 0
+
+
+class TestDeployFailuresAreNamedForWhatHappened:
+    """Every OSError from the copy used to be reported as `artifact_locked`,
+    whose hint says the game is probably running. That is right for the
+    common case and actively misleading for the rest: telling someone to
+    close a game they have already closed sends the whole investigation the
+    wrong way, and a full disk does not fix itself while they try."""
+
+    class _SharingViolation(OSError):
+        """What Windows raises when another process holds the file open."""
+
+        winerror = 32
+
+    @pytest.fixture()
+    def ready_to_deploy(self, fake_game, tmp_path):
+        context = detect_framework(fake_game("Game"))
+        artifact = tmp_path / "MyMod.dll"
+        artifact.write_bytes(b"")
+        return BepInEx5Adapter(), BuildOutcome(artifact=artifact), context
+
+    def test_a_locked_file_still_names_the_running_game(
+        self, ready_to_deploy, monkeypatch
+    ):
+        adapter, outcome, context = ready_to_deploy
+        monkeypatch.setattr(
+            bepinex5.shutil,
+            "copy2",
+            lambda *a, **k: (_ for _ in ()).throw(self._SharingViolation("locked")),
+        )
+
+        with pytest.raises(ArtifactLockedError) as caught:
+            adapter.deploy(outcome, context)
+
+        assert any("running" in hint for hint in caught.value.hints)
+
+    def test_a_full_disk_is_not_blamed_on_the_game(
+        self, ready_to_deploy, monkeypatch
+    ):
+        adapter, outcome, context = ready_to_deploy
+        monkeypatch.setattr(
+            bepinex5.shutil,
+            "copy2",
+            lambda *a, **k: (_ for _ in ()).throw(
+                OSError(errno.ENOSPC, "No space left on device")
+            ),
+        )
+
+        with pytest.raises(DeployFailedError) as caught:
+            adapter.deploy(outcome, context)
+
+        assert not any("running" in hint for hint in caught.value.hints)

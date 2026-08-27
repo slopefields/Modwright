@@ -34,6 +34,12 @@ class ErrorCode(StrEnum):
     ARTIFACT_LOCKED = "artifact_locked"
     #: Deploy target is not a usable loader tree for this framework.
     INVALID_DEPLOY_ROOT = "invalid_deploy_root"
+    #: The copy into the mods folder failed for a reason that is NOT the file
+    #: being locked -- no space, a read-only volume, a path the filesystem
+    #: rejects. Separate from `ARTIFACT_LOCKED` because that one names a cause
+    #: ("the game is running") and telling a user to close a game they have
+    #: already closed is the worst kind of wrong answer.
+    DEPLOY_FAILED = "deploy_failed"
     #: More than one place this mod could be installed, and none was chosen.
     #: Not a failure to be retried -- the user has to pick.
     DEPLOY_TARGET_UNSET = "deploy_target_unset"
@@ -112,6 +118,10 @@ class ArtifactLockedError(ModwrightError):
 
 class InvalidDeployRootError(ModwrightError):
     code = ErrorCode.INVALID_DEPLOY_ROOT
+
+
+class DeployFailedError(ModwrightError):
+    code = ErrorCode.DEPLOY_FAILED
 
 
 class DeployTargetUnsetError(ModwrightError):
