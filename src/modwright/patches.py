@@ -99,8 +99,16 @@ def extract_harmony_targets(mod_source_dir: Path) -> list[PatchTarget]:
 
     for source_file in sorted(mod_source_dir.rglob("*.cs")):
         # Skip build output; it contains generated sources that are not the
-        # author's and would double-report every target.
-        if any(part in {"bin", "obj"} for part in source_file.parts):
+        # author's and would double-report every target. Judged on the path
+        # WITHIN the project: matching against the absolute path meant a
+        # project living anywhere under a folder called `bin` or `obj` had
+        # every one of its files skipped, and reported zero patch targets --
+        # which is indistinguishable from a mod that patches nothing, and is
+        # reported as `patches_checked: 0` rather than as a problem.
+        if any(
+            part in {"bin", "obj"}
+            for part in source_file.relative_to(mod_source_dir).parts
+        ):
             continue
         source = source_file.read_bytes()
         tree = parser.parse(source)

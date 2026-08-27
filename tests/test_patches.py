@@ -296,3 +296,48 @@ class P {
         empty = tmp_path / "empty"
         empty.mkdir()
         assert extract_harmony_targets(empty) == []
+
+
+class TestBuildOutputIsJudgedWithinTheProject:
+    """`bin` and `obj` are skipped as build output, but the check used to run
+    over the whole absolute path -- so a project living anywhere under a
+    folder with either name had every one of its source files skipped and
+    reported no patch targets at all. That surfaces as `patches_checked: 0`,
+    which is indistinguishable from a mod that patches nothing."""
+
+    def test_a_project_under_a_folder_named_bin_is_still_read(self, tmp_path):
+        project = tmp_path / "bin" / "MyMod"
+        project.mkdir(parents=True)
+        (project / "Patches.cs").write_text(
+            'using HarmonyLib;\n'
+            'class P {\n'
+            '    [HarmonyPatch(typeof(EnemyAI), "KillEnemy")]\n'
+            '    static void Postfix() { }\n'
+            '}\n',
+            encoding="utf-8",
+        )
+
+        found = [t.display for t in extract_harmony_targets(project)]
+
+        assert found == ["EnemyAI.KillEnemy"]
+
+    def test_the_projects_own_build_output_is_still_skipped(self, tmp_path):
+        project = tmp_path / "obj" / "MyMod"
+        (project / "obj" / "Debug").mkdir(parents=True)
+        (project / "Patches.cs").write_text(
+            'using HarmonyLib;\n'
+            'class P {\n'
+            '    [HarmonyPatch(typeof(EnemyAI), "KillEnemy")]\n'
+            '    static void Postfix() { }\n'
+            '}\n',
+            encoding="utf-8",
+        )
+        (project / "obj" / "Debug" / "Generated.cs").write_text(
+            '[HarmonyPatch(typeof(Fake), "Generated")] class G { '
+            "static void Postfix() { } }",
+            encoding="utf-8",
+        )
+
+        found = [t.display for t in extract_harmony_targets(project)]
+
+        assert found == ["EnemyAI.KillEnemy"]
