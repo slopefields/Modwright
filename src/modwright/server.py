@@ -217,24 +217,21 @@ def scaffold_mod_project(
     install_root: str,
     project_path: str,
     mod_name: str,
-    deploy_root: str | None = None,
 ) -> dict[str, Any]:
     """Create a buildable mod project targeting a specific game install.
 
     References to the game's own assemblies are resolved automatically from the
     detected install, which is the step framework templates leave manual.
 
-    Pass `deploy_root` when mods are run through a manager (r2modman,
-    Thunderstore Mod Manager, Gale) rather than from the game folder: the
-    project still compiles against the install, but deploys into that
-    profile and reads its log. `list_mod_profiles` finds the candidates.
+    Where the mod DEPLOYS is a separate decision, made with `set_deploy_target`
+    and asked about per project. Scaffolding deliberately cannot set it: the
+    target is the one field that must not be inherited from whatever the last
+    project used, and taking it here let a caller supply a profile nobody had
+    chosen. `deploy_mod` refuses until it is set, and lists the candidates.
     """
     context = detect_framework(install_root)
     adapter = get_adapter(context.framework_id)
     project = Path(project_path)
-
-    if deploy_root:
-        context = adapter.adopt_loader_root(context, Path(deploy_root))
 
     written = adapter.scaffold(project, context, mod_name)
     config = ProjectConfig(
@@ -246,13 +243,27 @@ def scaffold_mod_project(
     )
     written.append(config.save(project))
 
-    return {
+    response = {
         "success": True,
         "project_path": str(project),
         "framework": adapter.display_name,
         "deploy_root": config.deploy_root,
         "files_written": [str(p) for p in written],
     }
+    if adapter.supports_deploy_target and config.deploy_root is None:
+        # Said at scaffold time rather than left for `deploy_mod` to refuse.
+        # The decision is the user's and it is cheapest to make now, while
+        # they are already deciding things about this project.
+        response["deploy_target_required"] = True
+        response["hints"] = [
+            "This project has no deploy target yet. Ask which profile it "
+            "should install into, then set it with set_deploy_target -- "
+            "list_mod_profiles shows the candidates with their mod counts.",
+            "Ask per project rather than reusing the last one. Only one "
+            "profile is active per launch, so a mod deployed into the wrong "
+            "one builds, deploys, and then loads nothing.",
+        ]
+    return response
 
 
 @mcp.tool()
