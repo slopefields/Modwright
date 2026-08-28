@@ -95,7 +95,10 @@ class _Candidate:
 
 
 def diagnose_silence(
-    context: GameContext, adapter: Any, target_log: Path | None
+    context: GameContext,
+    adapter: Any,
+    target_log: Path | None,
+    artifact: Path | None = None,
 ) -> dict[str, Any]:
     """Explain why the target loader shows no sign of having run.
 
@@ -120,7 +123,7 @@ def diagnose_silence(
     # last week get compared and the older one is reported as the wrong
     # profile -- on the very first poll, before the player has had a chance
     # to launch anything.
-    deployed_at = last_deployed(context)
+    deployed_at = last_deployed(context, artifact)
     latest_run = max(
         (t for t in (target_written, newest.written_at if newest else None)
          if t is not None),
@@ -186,7 +189,9 @@ def diagnose_silence(
     return _payload(LOADER_WROTE_NOTHING, target_root, hints=hints)
 
 
-def diagnose_no_restart(context: GameContext, target_log: Path) -> dict[str, Any]:
+def diagnose_no_restart(
+    context: GameContext, target_log: Path, artifact: Path | None = None
+) -> dict[str, Any]:
     """Report that the log grew without the loader having started up in it.
 
     Deliberately states only that, and hands the agent the one fact it needs
@@ -223,7 +228,7 @@ def diagnose_no_restart(context: GameContext, target_log: Path) -> dict[str, Any
         ],
     )
     payload["log_path"] = str(target_log)
-    payload["deployed_at"] = _isoformat(last_deployed(context))
+    payload["deployed_at"] = _isoformat(last_deployed(context, artifact))
     return payload
 
 
@@ -266,16 +271,28 @@ def _candidates(context: GameContext, adapter: Any) -> list[_Candidate]:
     return found
 
 
-def last_deployed(context: GameContext) -> float | None:
-    """When something was last installed into the target's mods folder.
+def last_deployed(context: GameContext, artifact: Path | None = None) -> float | None:
+    """When THIS project's mod was last built and put in place.
 
-    Read as the newest file in there rather than the folder's own timestamp:
-    on Windows a directory's mtime does not move when an existing file is
-    overwritten, and overwriting is exactly what a redeploy does -- so the
-    folder would report the FIRST deploy forever. `shutil.copy2` carries the
-    build's timestamp across, which makes this "when was this code last
-    built and put here", which is the question worth asking.
+    `artifact` is the file `deploy_mod` recorded copying, and is the whole
+    answer when it is known: `shutil.copy2` carries the build's timestamp
+    across, so its mtime is when this code was built, which is the question
+    worth asking.
+
+    The fallback -- the newest file anywhere in the mods folder -- is what
+    this used to do unconditionally, and it answers a different question than
+    the one it was asked. That folder holds every mod the user has installed,
+    so updating a dependency moved `deployed_at` forward and made a perfectly
+    current log look stale. It survives only for projects deployed before the
+    artifact was recorded, where a rough answer beats none.
+
+    A recorded artifact that is no longer on disk returns None rather than
+    falling back. Nothing is deployed, and saying "unknown" is honest where
+    ranking the neighbours would invent a deploy that is not there.
     """
+    if artifact is not None:
+        return mtime_of(artifact)
+
     mods_dir = context.mods_dir
     if mods_dir is None or not mods_dir.is_dir():
         return None

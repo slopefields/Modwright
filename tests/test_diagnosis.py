@@ -54,6 +54,13 @@ def _deploy(loader_root, *, age_days: int = 0):
     return artifact
 
 
+def _record_deploy(project_path, artifact) -> None:
+    """Note the deployed file the way `deploy_mod` does, without a build."""
+    config = ProjectConfig.load(project_path)
+    config.deployed_artifact = str(artifact)
+    config.save(project_path)
+
+
 @pytest.fixture()
 def adapter() -> BepInEx5Adapter:
     return BepInEx5Adapter()
@@ -458,6 +465,28 @@ class TestStaleContent:
             return path, target
 
         return _build
+
+    def test_a_neighbouring_mod_does_not_count_as_this_deploy(self, project):
+        """The bug this class exists for, pointed the other way.
+
+        `plugins` holds every mod the user has installed. Reading "when was my
+        mod deployed" as the newest file in there meant updating a dependency
+        moved the deploy forward, and a log written since the real deploy got
+        reported as predating it. The recorded artifact settles it: the
+        neighbour is newer than everything and changes nothing.
+        """
+        path, target = project(log=True, disk_logging=True)
+        artifact = _deploy(target, age_days=1)
+        _age(target / "BepInEx" / "LogOutput.log", seconds=3600)
+        _record_deploy(path, artifact)
+        # Somebody else's mod, installed after ours and after the log was
+        # written -- exactly what the folder scan used to pick up.
+        (target / "BepInEx" / "plugins" / "SomeoneElse.dll").write_bytes(b"x")
+
+        result = server.watch_mod_logs(str(path))
+
+        assert result["content"]
+        assert "diagnosis" not in result
 
     def test_content_older_than_the_deploy_is_still_diagnosed(self, project):
         path, target = project(log=True, disk_logging=True)

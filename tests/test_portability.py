@@ -61,6 +61,7 @@ class TestWhatGetsCommitted:
         assert str(game) not in committed
         assert "install_root" not in committed
         assert "deploy_root" not in committed
+        assert "deployed_artifact" not in committed
 
     def test_what_the_mod_needs_is_committed(self, project):
         """A clone has to know what it is looking at. The game, framework and
@@ -78,7 +79,7 @@ class TestWhatGetsCommitted:
         local = json.loads((path / LOCAL_CONFIG_FILENAME).read_text(encoding="utf-8"))
 
         assert local["install_root"] == str(game)
-        assert set(local) == {"install_root", "deploy_root"}
+        assert set(local) == {"install_root", "deploy_root", "deployed_artifact"}
 
     def test_both_local_files_are_gitignored(self, project):
         path, _ = project

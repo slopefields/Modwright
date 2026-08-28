@@ -18,14 +18,14 @@ from modwright.errors import ProjectNotConfiguredError, ProjectNotFoundError
 #: what it needs, with no path in it anywhere.
 CONFIG_FILENAME = ".modwright.json"
 
-#: NOT committed. Holds the two fields that describe one person's disk. A mod
+#: NOT committed. Holds the fields that describe one person's disk. A mod
 #: repo pushed to a public host must not publish where its author keeps their
 #: games: `deploy_root` alone would give away the username, the mod manager in
 #: use, and the profile name.
 LOCAL_CONFIG_FILENAME = ".modwright.local.json"
 
 #: Which fields go in the local file. Deliberately the paths and nothing else.
-_LOCAL_FIELDS = ("install_root", "deploy_root")
+_LOCAL_FIELDS = ("install_root", "deploy_root", "deployed_artifact")
 
 
 @dataclass
@@ -69,6 +69,12 @@ class ProjectConfig:
     deploy_root: str | None = None
     #: Other mods this project compiles against.
     references: list[ModReference] = field(default_factory=list)
+    #: Where `deploy_mod` last copied this project's build. Written by the
+    #: deploy rather than guessed later, because the mods folder holds every
+    #: mod the user has installed and the newest file in it is very often
+    #: somebody else's -- which made "has the game run since MY deploy?" a
+    #: question about whoever updated a dependency most recently.
+    deployed_artifact: str | None = None
 
     def save(self, project_path: Path) -> Path:
         """Write both halves: the shared config and this machine's paths."""

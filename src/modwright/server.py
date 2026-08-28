@@ -839,6 +839,11 @@ async def deploy_mod(project_path: str) -> dict[str, Any]:
         Path(project_path), context, adapter, config
     )
     deployed = adapter.deploy(outcome, context)
+    # Recorded rather than rediscovered. "Has the game run since I deployed?"
+    # is answered against this exact file; inferring it from the mods folder
+    # answers it against whichever dependency the user updated most recently.
+    config.deployed_artifact = str(deployed.destination)
+    config.save(Path(project_path))
     return {
         "success": True,
         "destination": str(deployed.destination),
@@ -849,6 +854,15 @@ async def deploy_mod(project_path: str) -> dict[str, Any]:
         "log_cursor": _log_length(adapter, context),
         **checked,
     }
+
+
+def _deployed_artifact(config: ProjectConfig) -> Path | None:
+    """The file this project last deployed, if a deploy has recorded one.
+
+    None for a project last deployed by an older ModWright, which sends
+    `last_deployed` to its folder-scan fallback rather than to nothing.
+    """
+    return Path(config.deployed_artifact) if config.deployed_artifact else None
 
 
 def _log_length(adapter: Any, context: GameContext) -> int | None:
@@ -903,7 +917,8 @@ def watch_mod_logs(
     `reason` reports what was observed, not what caused it: ask the user
     before acting on it, since the likeliest fixes are opposites.
     """
-    context, adapter, _ = _context_for_project(Path(project_path))
+    context, adapter, config = _context_for_project(Path(project_path))
+    artifact = _deployed_artifact(config)
     log_path = adapter.resolve_log(context)
     if log_path is None:
         # No log at all is the strongest form of "nothing was written here",
@@ -913,7 +928,9 @@ def watch_mod_logs(
         raise LogNotFoundError(
             f"No log file found for {context.game_name}.",
             hints=["Run the game at least once with the mod loader installed."],
-            details={"diagnosis": diagnose_silence(context, adapter, None)},
+            details={
+                "diagnosis": diagnose_silence(context, adapter, None, artifact)
+            },
         )
 
     read = read_since(
@@ -930,7 +947,7 @@ def watch_mod_logs(
     # text alone cannot be told apart from a live session. One timestamp does
     # not settle it either -- there has to be something to compare it against.
     log_written_at = mtime_of(log_path)
-    deployed_at = last_deployed(context)
+    deployed_at = last_deployed(context, artifact)
     restarted = _restarted_since_cursor(read, since_cursor)
     response = {
         "success": True,
@@ -967,12 +984,14 @@ def watch_mod_logs(
         # loop, and the profile scan behind this diagnosis must stay off that
         # path. Content written since the deploy proves the loader is running,
         # which is all the scan could have established anyway.
-        response["diagnosis"] = diagnose_silence(context, adapter, log_path)
+        response["diagnosis"] = diagnose_silence(
+            context, adapter, log_path, artifact
+        )
     elif restarted is False:
         # It does NOT prove the loader started since the deploy, though, and
         # that is the question a redeploy actually asks. Cheap by comparison:
         # no scan, only what this read already saw.
-        response["diagnosis"] = diagnose_no_restart(context, log_path)
+        response["diagnosis"] = diagnose_no_restart(context, log_path, artifact)
     return response
 
 
