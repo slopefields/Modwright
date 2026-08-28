@@ -10,7 +10,9 @@ matching on message text.
 from __future__ import annotations
 
 import functools
+import time
 from datetime import datetime
+from importlib import metadata
 from pathlib import Path
 from typing import Any, Callable
 
@@ -163,6 +165,70 @@ def _require_chosen_target(
             ]
         },
     )
+
+
+#: When this process imported the server. Recorded at import rather than
+#: asked of the OS, which needs a dependency to answer on Windows and answers
+#: a slightly different question anyway: what matters is when this CODE began
+#: running, not when the interpreter did.
+_STARTED_AT = time.time()
+
+
+@mcp.tool()
+@_tool
+def server_info() -> dict[str, Any]:
+    """Report which ModWright is answering, and whether it is up to date.
+
+    Call this first in a session that is about to trust the other tools.
+    ModWright is normally installed editable, so the server imports straight
+    out of a working tree -- and a process started before an edit goes on
+    serving the code it loaded, with nothing in any response to say so. Every
+    tool then answers correctly for a version of itself that no longer exists,
+    which is indistinguishable from a bug in whatever is being debugged.
+
+    `source_stale` is the answer: true when a `.py` under `source_root` has
+    changed since this process imported it. Restart the server and try again
+    before reading anything into the tools' behaviour. Establishing this used
+    to mean reading `.pth` files, comparing a process start time against
+    source timestamps, and counting tool definitions by hand.
+
+    `version` is what the installed distribution claims. It is reported
+    separately from `source_root` on purpose: an editable install pins the
+    metadata at install time, so a version bumped in `pyproject.toml` since
+    then is still reported as the old one. Disagreement there is a packaging
+    detail, not a stale server -- `source_stale` is the field that matters.
+    """
+    source_root = Path(__file__).resolve().parent
+    newest = _newest_source_change(source_root)
+    try:
+        version = metadata.version("modwright-mcp")
+    except metadata.PackageNotFoundError:
+        # Running from a checkout that was never installed. Not a failure:
+        # the source location below is the answer that was being asked for.
+        version = None
+
+    return {
+        "success": True,
+        "version": version,
+        "source_root": str(source_root),
+        "started_at": _isoformat(_STARTED_AT),
+        "newest_source_change": _isoformat(newest),
+        "source_stale": newest is not None and newest > _STARTED_AT,
+    }
+
+
+def _newest_source_change(source_root: Path) -> float | None:
+    """When any of this server's own modules was last edited.
+
+    Only `.py` files, and only under the package: a changed template or test
+    cannot be what the running process is serving, and pulling in the whole
+    repository would make this report a stale server every time a README moved.
+    """
+    try:
+        stamps = [path.stat().st_mtime for path in source_root.rglob("*.py")]
+    except OSError:
+        return None
+    return max(stamps, default=None)
 
 
 @mcp.tool()
