@@ -696,7 +696,7 @@ class TestDeployHandsBackALogCursor:
             handle.write("[Message:   BepInEx] Chainloader started\n")
 
         polled = server.watch_mod_logs(str(path), since_cursor=cursor)
-        assert polled["loader_restarted_since_cursor"] is True
+        assert polled["running_this_build"] is True
 
 
 class TestAssemblyClassificationReadsOnlyTheHeader:

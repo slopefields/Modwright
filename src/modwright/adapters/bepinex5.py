@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import time
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Thread
@@ -35,6 +36,7 @@ from modwright.models import (
     DeployOutcome,
     GameContext,
     LoaderInfo,
+    LoaderSession,
     LoggingStatus,
     PatchTarget,
 )
@@ -875,6 +877,77 @@ class BepInEx5Adapter:
         exactly one of these no matter how many times the game has been run.
         """
         return log_text.count(self._CHAINLOADER_BANNER)
+
+    #: HarmonyX prints these three lines when a plugin creates its Harmony
+    #: instance: the mod's announced name, the exact file it was loaded from,
+    #: and when. Between them they answer "is the running game running the
+    #: build I just deployed" outright, which is what the cursor could only
+    #: ever guess at.
+    _LOADING = re.compile(r"Loading \[(?P<name>.+?) [^\s\]]+\]")
+    _STARTED_FROM = re.compile(r"^### Started from .*, location (?P<path>.+?)\s*$")
+    _STARTED_AT = re.compile(r"^### At (?P<stamp>\d{4}-\d{2}-\d{2} \d{2}\.\d{2}\.\d{2})\s*$")
+    #: How far past `### Started from` to keep looking for its `### At`. They
+    #: are adjacent in every log seen, but a bound beats an open scan that
+    #: could pair one plugin's path with the next plugin's timestamp.
+    _AT_WITHIN_LINES = 4
+
+    def read_session(self, log_text: str, plugin_file: str) -> LoaderSession | None:
+        """What this log says about loading `plugin_file`, if anything.
+
+        Matched on the DLL's filename rather than the mod's announced name:
+        the name comes from a `BepInPlugin` attribute the author can change
+        to anything, while the filename is what was actually deployed. The
+        full path found is reported rather than merely checked, because a
+        path that does not match the deploy destination is its own finding --
+        a stale copy loading out of another tree, which no startup banner can
+        see.
+
+        Returns None when the mod is not mentioned at all, which means "this
+        log does not show it loading" and never "it did not load". Callers
+        must keep those apart: reporting absence as a negative is the failure
+        this whole method exists to replace.
+        """
+        lines = log_text.splitlines()
+        wanted = plugin_file.casefold()
+        announced: str | None = None
+
+        for index, line in enumerate(lines):
+            loading = self._LOADING.search(line)
+            if loading is not None:
+                # Held rather than matched on: the announced name is the only
+                # place a version-stamped human label appears, but it is not
+                # trustworthy enough to identify the plugin by.
+                announced = loading.group("name")
+                continue
+
+            started = self._STARTED_FROM.match(line)
+            if started is None:
+                continue
+            path = Path(started.group("path"))
+            if path.name.casefold() != wanted:
+                announced = None
+                continue
+
+            return LoaderSession(
+                started_at=self._started_at(lines, index),
+                plugin_path=path,
+                plugin_name=announced,
+            )
+        return None
+
+    def _started_at(self, lines: list[str], index: int) -> datetime | None:
+        """The `### At` stamp belonging to the block starting at `index`."""
+        for line in lines[index + 1 : index + 1 + self._AT_WITHIN_LINES]:
+            found = self._STARTED_AT.match(line)
+            if found is None:
+                continue
+            try:
+                return datetime.strptime(found.group("stamp"), "%Y-%m-%d %H.%M.%S")
+            except ValueError:
+                # A malformed stamp is unknown, not zero. Falling through to
+                # None keeps it that way.
+                return None
+        return None
 
     def inspect_logging(self, loader_root: Path) -> LoggingStatus:
         config_path = loader_root / "BepInEx" / "config" / "BepInEx.cfg"

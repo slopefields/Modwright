@@ -826,12 +826,14 @@ async def deploy_mod(project_path: str) -> dict[str, Any]:
     game always matches the source on disk. Reports `patches_checked` the same
     way `build_mod` does, since this is the last step before a launch.
 
-    Also returns `log_cursor`: the log's length at the moment the file was
-    placed. Pass it to `watch_mod_logs` as `since_cursor` on the next poll and
-    keep passing it until the loader is seen starting up. That is the only way
-    to establish that the running game is running THIS build -- a mod assembly
-    is loaded once at process start, so a game left open through the deploy
-    keeps writing to its log with the previous build still in memory.
+    Also records where the build was placed, so `watch_mod_logs` can tell
+    whether the running game is running THIS build: a mod assembly is loaded
+    once at process start, so a game left open through the deploy keeps
+    writing to its log with the previous build still in memory.
+
+    Also returns `log_cursor`, the log's length as of the copy. It is only a
+    reading position for the next poll now -- the question of which build is
+    running is answered from the loader's own record, not from this offset.
     """
     context, adapter, config = _context_for_project(Path(project_path))
     _require_chosen_target(context, adapter, config)
@@ -902,13 +904,15 @@ def watch_mod_logs(
     before this build existed, which reads exactly like a live session.
 
     A log NEWER than the deploy is not the all-clear it looks like, which is
-    why every read also reports `loader_restarted_since_cursor`. Mod assemblies
-    are loaded once when the game process starts, so a game left running
-    through a redeploy goes on writing to the same log with the previous build
-    in memory -- fresh content and all. Only a loader startup seen in the new
-    content, or a truncated log, shows a new process. Poll from the
-    `log_cursor` that `deploy_mod` returns and keep polling from it until this
-    turns true; `null` means the read had no cursor to compare against.
+    why every read also reports `running_this_build`. Mod assemblies are
+    loaded once when the game process starts, so a game left running through a
+    redeploy goes on writing to the same log with the previous build in memory
+    -- fresh content and all. This compares the loader's own record of when it
+    loaded the mod against when that file was built, so it holds on the FIRST
+    poll and needs no cursor: `true` means the running process is running this
+    build, `false` means it is running an older one and must be relaunched,
+    and `null` means the log carries no such record and neither is claimed.
+    `plugin_loaded_at` quotes the timestamp it read.
 
     A `diagnosis` explains anything that does not add up -- nothing new to
     read, nothing written since the deploy, or content with no restart behind
@@ -941,6 +945,15 @@ def watch_mod_logs(
         # the startup banner sits at the top of a freshly truncated log, and
         # the tail is exactly what drops it.
         loader_starts=adapter.count_loader_starts,
+        # Read from the TOP of the log, which is where the loader records what
+        # it loaded and exactly what a cursor from a previous session skips.
+        # Only askable once there is a file to ask about: an older project
+        # never recorded one, and the fallback below covers it.
+        read_session=(
+            (lambda text: adapter.read_session(text, artifact.name))
+            if artifact is not None
+            else None
+        ),
     )
     # Both on every read, not just empty ones. A read with no cursor returns
     # the tail of whatever is already there, which can be weeks old, and the
@@ -948,7 +961,8 @@ def watch_mod_logs(
     # not settle it either -- there has to be something to compare it against.
     log_written_at = mtime_of(log_path)
     deployed_at = last_deployed(context, artifact)
-    restarted = _restarted_since_cursor(read, since_cursor)
+    session = read.session
+    running = _running_this_build(read, since_cursor, deployed_at)
     response = {
         "success": True,
         "log_path": str(read.path),
@@ -956,21 +970,45 @@ def watch_mod_logs(
         "content": read.content,
         "log_written_at": _isoformat(log_written_at),
         "deployed_at": _isoformat(deployed_at),
-        "loader_restarted_since_cursor": restarted,
+        "running_this_build": running,
+        # The loader's own account of when it loaded the mod, quoted rather
+        # than only compared, so an agent can check the arithmetic instead of
+        # taking a bare boolean on trust.
+        "plugin_loaded_at": (
+            session.started_at.isoformat(timespec="seconds")
+            if session is not None and session.started_at is not None
+            else None
+        ),
     }
+    hints: list[str] = []
+
+    if session is not None and artifact is not None and session.plugin_path is not None:
+        if _resolved(session.plugin_path) != _resolved(artifact):
+            # The mod loaded, but not from where this project deploys. A
+            # startup banner cannot see this at all: the loader started and a
+            # plugin by that name loaded, and everything reads as success
+            # while an old copy in another tree is what is running.
+            hints.append(
+                f"The running game loaded {session.plugin_path}, which is not "
+                f"where this project deploys ({artifact}). A stale copy in "
+                "another loader tree is shadowing this build -- delete it, or "
+                "point the deploy target at the tree that is actually used."
+            )
 
     # Said out loud, never left to be inferred from a short read. An agent
     # given the tail of a session with no note that it IS a tail will read
     # the missing lines as the loader having gone quiet.
     if read.omitted_lines:
         response["omitted_lines"] = read.omitted_lines
-        response["hints"] = [
+        hints.append(
             f"{read.omitted_lines} earlier line(s) were written since this "
             f"cursor and are not shown -- only the last {lines} are. Raise "
             "`lines` for more, or open the log at `log_path` for all of it. "
-            "The restart check above still looked at every line, including "
-            "these.",
-        ]
+            "`running_this_build` does not depend on this content at all: it "
+            "is read from the top of the log, which a tail never reaches."
+        )
+    if hints:
+        response["hints"] = hints
 
     # Stale content is silence too. Gating on an empty read alone missed the
     # most common shape of this bug entirely: after a redeploy the agent reads
@@ -987,34 +1025,70 @@ def watch_mod_logs(
         response["diagnosis"] = diagnose_silence(
             context, adapter, log_path, artifact
         )
-    elif restarted is False:
-        # It does NOT prove the loader started since the deploy, though, and
-        # that is the question a redeploy actually asks. Cheap by comparison:
-        # no scan, only what this read already saw.
-        response["diagnosis"] = diagnose_no_restart(context, log_path, artifact)
+    elif running is False:
+        # It does NOT prove the RUNNING process is running this build, which
+        # is the question a redeploy actually asks. Only reached now when the
+        # loader itself dated the load earlier than the build -- no longer on
+        # a banner this read happened not to see. Cheap by comparison: no
+        # scan, only what this read already had in hand.
+        response["diagnosis"] = diagnose_no_restart(
+            context, log_path, artifact, session
+        )
     return response
 
 
-def _restarted_since_cursor(read: LogRead, since_cursor: int | None) -> bool | None:
-    """Whether a new game process began since the cursor was handed out.
+def _resolved(path: Path) -> Path:
+    """Canonical form, for comparing two paths that reached here differently.
 
-    None when there was no cursor: the first read of a session establishes the
-    baseline and has nothing behind it to have restarted since.
-
-    Two independent signals, either of which is proof. The loader truncated
-    its log, which loaders do on startup; or its startup banner appears in the
-    bytes just read. Both are needed -- a log truncated and then regrown past
-    the old cursor leaves no short file to catch, and a cursor already sitting
-    past the banner leaves no banner to find.
-
-    False therefore means "neither was seen", not "definitely did not happen",
-    and the diagnosis it triggers is worded that way. That is the safe
-    direction to be wrong in: it asks for a relaunch that already happened,
-    where the old behaviour blessed a game running last week's build.
+    One comes out of a log the loader wrote, the other out of this project's
+    config; short names, casing and separators can all differ while naming
+    the same file, and reporting that as a mismatch would send an agent
+    hunting a stale copy that does not exist.
     """
-    if since_cursor is None:
-        return None
-    return read.restarted or read.loader_starts > 0
+    try:
+        return Path(str(path).strip()).resolve()
+    except OSError:
+        return path
+
+
+#: How far a load may predate the build and still count as running it.
+#: HarmonyX stamps whole seconds and truncates, while a file's mtime carries
+#: a fraction, so a build at 01.39.17.8 loaded at 01.39.17.9 reads as one
+#: second EARLIER than the build it came from. One second of slack costs
+#: nothing -- a real stale session predates its build by minutes at least.
+_STAMP_SLACK_SECONDS = 1.0
+
+
+def _running_this_build(
+    read: LogRead, since_cursor: int | None, deployed_at: float | None
+) -> bool | None:
+    """Whether the process writing this log is running the deployed build.
+
+    Answered from the loader's own record of when it loaded the mod, compared
+    against when that file was built. That is an absolute comparison of two
+    timestamps, so it holds on the first poll, needs no previous read, and
+    cannot be defeated by where a byte offset happens to land.
+
+    The cursor signals survive only as a fallback, for a loader or a plugin
+    that leaves no such record, and they may now answer True or unknown but
+    never False. That asymmetry is the whole fix. Their False never meant "the
+    build is not loaded"; it meant "neither signal was seen", and the two are
+    not the same thing -- a loader truncates its log on startup, so a session
+    that outgrew the old cursor before being polled leaves no shorter file to
+    catch and no banner at any offset the cursor reaches. Reported as False,
+    that sent a working, patched, four-kills-deep session away to be quit and
+    relaunched. Unknown says the same amount and claims none of it.
+    """
+    session = read.session
+    if session is not None and session.started_at is not None and deployed_at is not None:
+        return session.started_at.timestamp() >= deployed_at - _STAMP_SLACK_SECONDS
+
+    if since_cursor is not None and (read.restarted or read.loader_starts > 0):
+        # A startup seen after the cursor still proves a new process began,
+        # and from a `deploy_mod` cursor that is proof enough. Only the
+        # negative was ever unsound.
+        return True
+    return None
 
 
 def main() -> None:

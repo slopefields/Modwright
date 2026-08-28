@@ -43,7 +43,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from modwright.models import GameContext
+from modwright.models import GameContext, LoaderSession
 from modwright.profiles import discover_profiles
 
 #: Logging is turned off for the target, so it writes nothing however well the
@@ -190,45 +190,49 @@ def diagnose_silence(
 
 
 def diagnose_no_restart(
-    context: GameContext, target_log: Path, artifact: Path | None = None
+    context: GameContext,
+    target_log: Path,
+    artifact: Path | None = None,
+    session: LoaderSession | None = None,
 ) -> dict[str, Any]:
-    """Report that the log grew without the loader having started up in it.
+    """Report that the running process is running an older build than this.
 
-    Deliberately states only that, and hands the agent the one fact it needs
-    to weigh it: where its previous cursor came from. `deploy_mod` hands back
-    a cursor taken the moment the file was placed, and a poll from THAT cursor
-    turns this into a hard result -- no startup since the deploy means the
-    running process cannot be running the deployed build. A poll from a cursor
-    taken mid-session means nothing more than that the game is still up.
+    Decisive now, where it used to be a guess dressed as one. The claim rests
+    on two timestamps the tool did not invent: when the loader says it loaded
+    the mod, and when the file it loaded was built. A load that predates its
+    own build is a running process holding an assembly read from disk before
+    the current one was written there, and a mod assembly is read once, at
+    process start.
 
-    The tool cannot tell those apart: a cursor is a byte offset with no
-    timestamp on it, and there is nothing in a loader log to date a process
-    start against -- BepInEx's banner carries the game executable's date, the
-    same value in every profile on the machine. So the ambiguity is stated
-    rather than guessed at, as with every other reason in this module.
+    What it replaced inferred the same conclusion from a byte offset -- no
+    startup banner after the cursor, therefore no restart -- which was wrong
+    whenever the loader truncated its log and wrote past the old offset before
+    being polled. That is the ordinary case, not a corner one, and it reported
+    a working session as stale and sent the user to relaunch a game that was
+    already running the build.
     """
     payload = _payload(
         NO_RESTART_SINCE_LAST_READ,
         context.effective_loader_root,
         hints=[
-            "The log has been written to since the last read, but none of the "
-            "new content shows the loader starting up and the file was never "
-            "truncated -- so the process that wrote it was already running "
-            "then. It is the same game session as before, not a new one.",
-            "This is decisive ONLY if that cursor came from deploy_mod, which "
-            "returns the cursor as of the moment the file was placed. In that "
-            "case the running game loaded the previous build and cannot pick "
-            "this one up: mod assemblies are read once at process start. Have "
-            "the user fully quit and relaunch, then poll again.",
-            "If the restart was already seen on an earlier poll, this is "
-            "simply an ongoing session and there is nothing to act on.",
-            "Do not treat 'the game is open' as a relaunch, and do not take "
-            "it on trust -- a menu-level exit and a missed kill both leave the "
-            "original process alive and appending to this same log.",
+            "The game is running, and the build it loaded is older than the "
+            "one on disk. Mod assemblies are read once at process start, so "
+            "this process cannot pick the new one up however long it runs.",
+            "Have the user fully quit and relaunch, then poll again. A "
+            "menu-level exit is not enough -- it leaves the original process "
+            "alive and appending to this same log.",
+            "This is read from the loader's own record of what it loaded, so "
+            "it holds regardless of which cursor the poll was made from.",
         ],
     )
     payload["log_path"] = str(target_log)
     payload["deployed_at"] = _isoformat(last_deployed(context, artifact))
+    if session is not None and session.started_at is not None:
+        payload["plugin_loaded_at"] = session.started_at.isoformat(
+            timespec="seconds"
+        )
+    if session is not None and session.plugin_path is not None:
+        payload["plugin_loaded_from"] = str(session.plugin_path)
     return payload
 
 

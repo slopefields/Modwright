@@ -9,14 +9,21 @@ slicing, because seeking a text-mode handle to a raw byte count is not valid
 per Python's `io` contract -- a multi-byte character straddling the offset
 would desynchronise the stream.
 
-The cursor doubles as the only usable evidence that the game RESTARTED, which
-is a different question from whether the log was written to and the one that
+The cursor was once the only evidence that the game RESTARTED, which is a
+different question from whether the log was written to and the one that
 actually matters after a redeploy: a mod assembly is loaded once when the
 process starts, so a game left running keeps writing to its log with the
-previous build still in memory. Nothing in a loader log is stamped with the
-process start time -- BepInEx's banner carries the game executable's date, the
-same value in every profile forever -- so "did a new process begin" can only be
-answered relative to a previous read. Hence `LogRead.restarted`.
+previous build still in memory. It was never good evidence. A cursor is a byte
+offset with no timestamp on it, and a loader that truncates its log on startup
+and then writes past the old offset before being polled leaves neither a
+shorter file to catch nor a banner at any offset the cursor reaches -- the
+ordinary case, which reported a working session as stale.
+
+So the loader's own account is read instead, from the HEAD of the file, which
+is where it records what it loaded and precisely the region a carried-over
+cursor skips. `LogRead.session` carries it. `LogRead.restarted` and
+`loader_starts` remain for loaders that record nothing usable, where they can
+still show that a new process began -- never that one did not.
 
 WHAT IS READ AND WHAT IS RETURNED ARE NOT THE SAME THING, and the difference
 is the point of `_tail`. A read resumed from a cursor covers everything
@@ -35,12 +42,20 @@ from __future__ import annotations
 from collections.abc import Callable
 from pathlib import Path
 
-from modwright.models import LogRead
+from modwright.models import LoaderSession, LogRead
 
 #: Bytes to scan back through when no cursor is supplied. Generous enough to
 #: hold a few hundred lines of a typical loader log without reading a log that
 #: has grown to hundreds of megabytes.
 _TAIL_WINDOW = 256 * 1024
+
+#: Bytes read from the START of the log, always, whatever the cursor says.
+#: This is where a loader records what it loaded, and it is precisely the
+#: region a cursor carried over from a previous session skips past -- the
+#: blind spot that had a running mod reported as never loaded. On the log
+#: that exposed it the whole startup block ends by byte 2313, so this is
+#: generous by two orders of magnitude.
+_HEAD_WINDOW = 256 * 1024
 
 #: Hard ceiling on the characters any single read returns, whatever `lines`
 #: asks for. `lines` is the caller's budget; this is the one that survives a
@@ -55,6 +70,7 @@ def read_since(
     since_cursor: int | None = None,
     lines: int = 50,
     loader_starts: Callable[[str], int] | None = None,
+    read_session: Callable[[str], LoaderSession | None] | None = None,
 ) -> LogRead:
     """Read new log content, returning it with the cursor to resume from.
 
@@ -75,31 +91,38 @@ def read_since(
     """
     size = log_path.stat().st_size
     restarted = False
+    if since_cursor is not None and since_cursor > size:
+        # The file shrank: the game restarted and the loader truncated its
+        # log. Resume from the beginning rather than returning junk -- and
+        # REPORT it, because a caller asking "is the build I just deployed the
+        # one running?" has no other way to know. Swallowing this silently is
+        # what left that question to be answered by hand outside the tool.
+        since_cursor = 0
+        restarted = True
 
     with log_path.open("rb") as handle:
-        if since_cursor is None:
-            start = max(0, size - _TAIL_WINDOW)
-            handle.seek(start)
-            text = _decode(handle.read())
-            if start > 0:
-                # The window almost certainly cut a line in half; drop the
-                # partial leader so the caller never sees a fragment.
-                text = text.partition("\n")[2]
-        else:
-            if since_cursor > size:
-                # The file shrank: the game restarted and the loader truncated
-                # its log. Resume from the beginning rather than returning junk
-                # -- and REPORT it, because a caller asking "is the build I
-                # just deployed the one running?" has no other way to know.
-                # Swallowing this silently is what left that question to be
-                # answered by hand outside the tool.
-                since_cursor = 0
-                restarted = True
-            handle.seek(since_cursor)
-            text = _decode(handle.read())
+        head, tail_start, tail = _windows(handle, size)
 
-    # Before the tail, never after: see the module docstring.
-    starts = loader_starts(text) if loader_starts is not None else 0
+    session = read_session(_decode(head)) if read_session is not None else None
+
+    # Counted over the bytes at or after the cursor, in both windows. Offsets
+    # matter here: a banner sitting BEFORE the cursor belongs to the session
+    # that was already running at the last read, and counting it would report
+    # a restart on every poll for as long as the game stays up.
+    starts = 0
+    if loader_starts is not None:
+        floor = since_cursor or 0
+        starts = sum(
+            loader_starts(_decode(chunk[max(0, floor - offset) :]))
+            for offset, chunk in _unread(head, tail_start, tail)
+        )
+
+    begin = 0 if since_cursor is None else max(0, since_cursor - tail_start)
+    text = _decode(tail[begin:])
+    if begin == 0 and tail_start > 0:
+        # The window almost certainly cut a line in half; drop the partial
+        # leader so the caller never sees a fragment.
+        text = text.partition("\n")[2]
     content, omitted = _tail(text, lines)
 
     return LogRead(
@@ -109,7 +132,47 @@ def read_since(
         restarted=restarted,
         loader_starts=starts,
         omitted_lines=omitted,
+        session=session,
     )
+
+
+def _windows(handle, size: int) -> tuple[bytes, int, bytes]:
+    """The head and tail of the log, as one read when they would overlap.
+
+    Two bounded reads rather than one open-ended one. The old shape read from
+    the cursor all the way to EOF on every poll, purely so the startup banner
+    could be counted -- which on a session left running is the whole session,
+    2.26 MB of it on the log that prompted this, decoded and thrown away to
+    return fifty lines. Nothing needs the middle: a loader truncates its log
+    when it starts, so what it recorded about loading sits at the top and what
+    just happened sits at the end.
+
+    Returns the head bytes, the offset the tail begins at, and the tail bytes.
+    A file small enough that the two windows would meet is read once and
+    shared, so no byte is decoded twice and no gap can open between them.
+    """
+    if size <= _HEAD_WINDOW + _TAIL_WINDOW:
+        handle.seek(0)
+        whole = handle.read()
+        return whole, 0, whole
+
+    handle.seek(0)
+    head = handle.read(_HEAD_WINDOW)
+    tail_start = size - _TAIL_WINDOW
+    handle.seek(tail_start)
+    return head, tail_start, handle.read()
+
+
+def _unread(head: bytes, tail_start: int, tail: bytes) -> list[tuple[int, bytes]]:
+    """The windows as (offset, bytes) pairs, without counting anything twice.
+
+    A small file is one buffer handed back under both names; returning it
+    under both would double every banner in it and report a restart that
+    never happened.
+    """
+    if tail_start == 0:
+        return [(0, head)]
+    return [(0, head), (tail_start, tail)]
 
 
 def _tail(text: str, lines: int) -> tuple[str, int]:

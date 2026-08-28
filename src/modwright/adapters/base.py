@@ -29,6 +29,7 @@ from modwright.models import (
     DeployOutcome,
     GameContext,
     LoaderInfo,
+    LoaderSession,
     LoggingStatus,
     PatchTarget,
 )
@@ -198,6 +199,29 @@ class ModFrameworkAdapter(Protocol):
         tell" -- an adapter whose loader prints no such banner should say so
         by returning 0 for everything, since the caller treats absence as
         "not observed" rather than as proof of anything.
+        """
+        ...
+
+    def read_session(self, log_text: str, plugin_file: str) -> LoaderSession | None:
+        """What the log's header says about loading `plugin_file`.
+
+        The absolute answer to "is the running game running the build I just
+        deployed", and the reason `count_loader_starts` is now only a
+        fallback. A cursor is a byte offset with no timestamp on it, so it can
+        say at best that something changed since the last read -- and it
+        cannot even do that reliably, because a loader that truncates its log
+        and then writes past the old offset leaves neither a shorter file nor
+        a banner in the region being read. A timestamp the loader wrote itself
+        has no such blind spot.
+
+        Given the TOP of the log rather than a slice since a cursor, for the
+        same reason: that is where a loader records what it loaded, and it is
+        exactly the region a cursor from a previous session skips past.
+
+        Must not raise, and None must mean "this log does not show it" and
+        never "it did not load" -- callers report the difference. An adapter
+        for a loader that records nothing usable should return None always,
+        which leaves the caller on the fallback rather than on a wrong answer.
         """
         ...
 

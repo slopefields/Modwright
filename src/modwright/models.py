@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 
@@ -161,6 +162,33 @@ class ValidatedTarget:
 
 
 @dataclass(frozen=True)
+class LoaderSession:
+    """What the log's own header says the running process loaded.
+
+    The answer to "is the game running the build I just deployed?" that does
+    not go through a cursor. A cursor is a byte offset with no timestamp on
+    it, so it can only ever say "something changed since last time"; this
+    says when THIS process started and which file it loaded the mod from,
+    which is the question that was being asked all along.
+
+    Both fields are optional because a loader may print one and not the
+    other, and because absence has to stay distinguishable from "no". A
+    plugin with no patches leaves no timestamp behind, and reporting that as
+    "did not restart" is the exact failure this replaces.
+    """
+
+    #: When the loader loaded the mod, from the log's own text. None when the
+    #: log carries no such stamp -- unknown, never "it did not happen".
+    started_at: datetime | None = None
+    #: The file the loader says it loaded the mod from. Compared against the
+    #: deploy destination, this catches a stale copy loading out of another
+    #: tree, which a startup banner alone cannot see.
+    plugin_path: Path | None = None
+    #: The mod's name as the loader announced it, for the response to quote.
+    plugin_name: str | None = None
+
+
+@dataclass(frozen=True)
 class LogRead:
     """A chunk of log content plus the cursor to resume from."""
 
@@ -188,3 +216,8 @@ class LogRead:
     #: rather than dropped quietly: an agent that cannot tell a complete read
     #: from a trimmed one will read a gap as evidence that nothing happened.
     omitted_lines: int = 0
+
+    #: What the log's header says the running process loaded, read from the
+    #: top of the file rather than from anything after the cursor. None when
+    #: the loader wrote nothing recognisable there.
+    session: LoaderSession | None = None

@@ -14,6 +14,7 @@ died before writing -- so nothing here may quietly pick one.
 from __future__ import annotations
 
 import os
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -52,6 +53,31 @@ def _deploy(loader_root, *, age_days: int = 0):
         when = os.stat(artifact).st_mtime - age_days * 86400
         os.utime(artifact, (when, when))
     return artifact
+
+
+def _stamp(*, hours_ago: int) -> str:
+    """A HarmonyX `### At` stamp, positioned against the clock the deploy uses.
+
+    Whole seconds, because that is the resolution HarmonyX writes and the
+    reason the comparison carries a second of slack.
+    """
+    when = datetime.now() - timedelta(hours=hours_ago)
+    return when.strftime("%Y-%m-%d %H.%M.%S")
+
+
+def _startup_block(artifact, stamp: str) -> str:
+    """The three lines BepInEx and HarmonyX write when a plugin loads.
+
+    Verbatim in shape from a real 2.4 MB Lethal Company log, because these
+    lines are a format this parser depends on rather than one it defines.
+    """
+    return (
+        "[Info   :   BepInEx] BepInEx 5.4.23.5 - Game (8/22/2026 4:40:30 PM)\n"
+        "[Info   :   BepInEx] Chainloader started\n"
+        "[Info   :   BepInEx] Loading [MyMod 1.0.0]\n"
+        f"### Started from void MyMod.Plugin::.ctor(), location {artifact}\n"
+        f"### At {stamp}\n"
+    )
 
 
 def _record_deploy(project_path, artifact) -> None:
@@ -569,9 +595,11 @@ class TestRestartDetection:
     full of plausible text -- and every check the tool had said yes while the
     game ran the old code.
 
-    Nothing in a loader log dates a process start (BepInEx's banner carries the
-    game executable's date, identical in every profile on a machine), so this
-    can only be answered against a previous cursor.
+    Answered from the loader's own record of what it loaded and when, read
+    from the top of the log. The cursor signals that came before could not
+    answer it: BepInEx truncates its log on startup, so a session that outgrew
+    the old offset before being polled leaves neither a shorter file to catch
+    nor a banner at any offset the cursor reaches.
     """
 
     @pytest.fixture()
@@ -593,24 +621,78 @@ class TestRestartDetection:
         with log.open("a", encoding="utf-8") as handle:
             handle.write(text)
 
-    def test_a_growing_log_with_no_startup_in_it_is_the_same_session(
-        self, project
-    ):
-        """The rehearsal's failure exactly: deploy, believe a relaunch
-        happened, poll, and read fresh output from the process that was
-        already running."""
-        path, log = project()
-        cursor = server.watch_mod_logs(str(path))["cursor"]
-        _deploy(log.parent.parent)
-        self._append(log, "[Info: MyMod] still the old build talking\n")
+    def test_a_load_after_the_build_is_this_build(self, project):
+        """The session's headline failure, in the shape that produced it.
 
-        result = server.watch_mod_logs(str(path), since_cursor=cursor)
+        Deploy hands back a cursor. BepInEx then truncates the log on relaunch
+        and the new session writes past that offset before the poll, so the
+        file is not short and the banner is behind the cursor -- both cursor
+        signals blind at once. The loader's own timestamp is not.
+        """
+        path, log = project()
+        artifact = _deploy(log.parent.parent, age_days=1)
+        _record_deploy(path, artifact)
+        log.write_text(
+            _startup_block(artifact, _stamp(hours_ago=1))
+            + "".join(f"line {i}\n" for i in range(5_000)),
+            encoding="utf-8",
+        )
+
+        result = server.watch_mod_logs(str(path), since_cursor=200)
+
+        assert result["running_this_build"] is True
+        assert result["plugin_loaded_at"]
+        assert "diagnosis" not in result
+
+    def test_a_load_before_the_build_is_the_previous_one(self, project):
+        """The failure the check exists for: the game was left running through
+        the redeploy, so it holds an assembly read before the build landed."""
+        path, log = project()
+        artifact = _deploy(log.parent.parent)
+        _record_deploy(path, artifact)
+        log.write_text(
+            _startup_block(artifact, _stamp(hours_ago=6))
+            + "[Info: MyMod] still the old build talking\n",
+            encoding="utf-8",
+        )
+
+        result = server.watch_mod_logs(str(path))
 
         assert result["content"]  # plenty to read, and none of it proves a thing
-        assert result["loader_restarted_since_cursor"] is False
+        assert result["running_this_build"] is False
         assert result["diagnosis"]["reason"] == NO_RESTART_SINCE_LAST_READ
 
-    def test_a_startup_banner_in_the_new_content_settles_it(self, project):
+    def test_the_verdict_does_not_need_a_cursor(self, project):
+        """It is two timestamps, so the first poll of a session answers it.
+
+        What it replaced could not: with nothing behind it to compare against,
+        a first read had to report "unknown" and the agent had to keep polling
+        to find out what was already true.
+        """
+        path, log = project()
+        artifact = _deploy(log.parent.parent, age_days=1)
+        _record_deploy(path, artifact)
+        log.write_text(_startup_block(artifact, _stamp(hours_ago=1)), encoding="utf-8")
+
+        assert server.watch_mod_logs(str(path))["running_this_build"] is True
+
+    def test_a_load_from_elsewhere_is_called_out(self, project):
+        """A stale copy in another tree loads under the same name and reads as
+        success everywhere. Only the path the loader recorded can see it."""
+        path, log = project()
+        artifact = _deploy(log.parent.parent, age_days=1)
+        _record_deploy(path, artifact)
+        elsewhere = artifact.parent.parent / "MyMod.dll"
+        log.write_text(_startup_block(elsewhere, _stamp(hours_ago=1)), encoding="utf-8")
+
+        result = server.watch_mod_logs(str(path))
+
+        assert any("shadowing this build" in hint for hint in result["hints"])
+
+    def test_a_startup_banner_still_settles_it_without_a_stamp(self, project):
+        """The fallback, for a plugin that records no load of its own. Weaker,
+        and still sound in this direction: a startup after a deploy-time cursor
+        did happen."""
         path, log = project()
         cursor = server.watch_mod_logs(str(path))["cursor"]
         _deploy(log.parent.parent)
@@ -618,12 +700,12 @@ class TestRestartDetection:
 
         result = server.watch_mod_logs(str(path), since_cursor=cursor)
 
-        assert result["loader_restarted_since_cursor"] is True
+        assert result["running_this_build"] is True
         assert "diagnosis" not in result
 
     def test_a_truncated_log_settles_it_too(self, project):
-        """The signal the user found by hand: BepInEx truncates on startup, so
-        the banner can end up before a stale cursor rather than after it."""
+        """The other fallback signal: BepInEx truncates on startup, so a log
+        shorter than the cursor is a process that began since."""
         path, log = project()
         _deploy(log.parent.parent)
         self._append(log, "a long previous session\n" * 40)
@@ -632,20 +714,32 @@ class TestRestartDetection:
         log.write_text("fresh, and shorter\n", encoding="utf-8")
         result = server.watch_mod_logs(str(path), since_cursor=cursor)
 
-        assert result["loader_restarted_since_cursor"] is True
+        assert result["running_this_build"] is True
         assert "diagnosis" not in result
 
-    def test_a_read_with_no_cursor_claims_nothing(self, project):
-        """Absence means "not known". The first read of a session is the
-        baseline -- there is nothing behind it to have restarted since, and
-        reporting False would read as a positive finding."""
+    def test_the_fallback_never_answers_no(self, project):
+        """The fix, stated as behaviour. Neither cursor signal firing means
+        "not seen", and the log that exposed this showed both going quiet on a
+        session that had restarted, was patched, and was working. Unknown says
+        as much as was actually known; False said more."""
+        path, log = project()
+        cursor = server.watch_mod_logs(str(path))["cursor"]
+        _deploy(log.parent.parent)
+        self._append(log, "[Info: MyMod] no startup record anywhere in here\n")
+
+        result = server.watch_mod_logs(str(path), since_cursor=cursor)
+
+        assert result["running_this_build"] is None
+        assert "diagnosis" not in result
+
+    def test_a_read_with_no_cursor_and_no_record_claims_nothing(self, project):
         path, log = project()
         _deploy(log.parent.parent)
         self._append(log, "written since the deploy\n")
 
         result = server.watch_mod_logs(str(path))
 
-        assert result["loader_restarted_since_cursor"] is None
+        assert result["running_this_build"] is None
         assert "diagnosis" not in result
 
     def test_silence_is_diagnosed_ahead_of_the_restart_check(self, project):
@@ -660,23 +754,20 @@ class TestRestartDetection:
 
         assert result["diagnosis"]["reason"] == NOTHING_RAN_SINCE_DEPLOY
 
-    def test_the_hint_says_the_verdict_depends_on_where_the_cursor_came_from(
-        self, project
-    ):
-        """False here means "not seen", not "did not happen" -- it is decisive
-        only from a deploy-time cursor. Stating that is the whole point: the
-        alternative is an agent treating a mid-session poll as a fault."""
+    def test_the_diagnosis_shows_its_working(self, project):
+        """It now asserts something decisive, so it has to hand over the two
+        timestamps it decided on rather than ask to be taken on trust."""
         path, log = project()
-        cursor = server.watch_mod_logs(str(path))["cursor"]
-        _deploy(log.parent.parent)
-        self._append(log, "more output\n")
+        artifact = _deploy(log.parent.parent)
+        _record_deploy(path, artifact)
+        log.write_text(_startup_block(artifact, _stamp(hours_ago=6)), encoding="utf-8")
 
-        hints = " ".join(
-            server.watch_mod_logs(str(path), since_cursor=cursor)["diagnosis"]["hints"]
-        )
+        diagnosis = server.watch_mod_logs(str(path))["diagnosis"]
 
-        assert "deploy_mod" in hints
-        assert "relaunch" in hints
+        assert diagnosis["plugin_loaded_at"]
+        assert diagnosis["deployed_at"]
+        assert diagnosis["plugin_loaded_from"] == str(artifact)
+        assert any("relaunch" in hint for hint in diagnosis["hints"])
 
 
 class TestAPollIsBounded:
@@ -740,5 +831,5 @@ class TestAPollIsBounded:
         result = server.watch_mod_logs(str(path), since_cursor=0, lines=20)
 
         assert "Chainloader started" not in result["content"]
-        assert result["loader_restarted_since_cursor"] is True
+        assert result["running_this_build"] is True
         assert "diagnosis" not in result
