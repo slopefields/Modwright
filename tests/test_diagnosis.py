@@ -477,7 +477,12 @@ class TestStaleContent:
         read the target fresh, and got its stale tail back with no warning."""
         other = profile("other", log=True, disk_logging=True)
         path, target = project(other, log=True, disk_logging=True)
-        _age(target / "BepInEx" / "LogOutput.log", seconds=86400)
+        # Two days against one, not "written a moment earlier". Windows file
+        # timestamps land on a coarse timer tick, so two files created
+        # back-to-back share an mtime the overwhelming majority of the time --
+        # this read `log == deploy`, which is not stale, and the test passed
+        # or failed on which side of a tick the fixture happened to land.
+        _age(target / "BepInEx" / "LogOutput.log", seconds=86400 * 2)
         _deploy(target, age_days=1)  # built yesterday; `other` ran since
 
         result = server.watch_mod_logs(str(path))
