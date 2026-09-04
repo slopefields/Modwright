@@ -21,6 +21,7 @@ across the frameworks on the roadmap -- do not "simplify" them away:
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
@@ -30,6 +31,8 @@ from modwright.models import (
     GameContext,
     LoaderInfo,
     LoaderSession,
+    LoadRecording,
+    LoadRecordingChange,
     LoggingStatus,
     PatchTarget,
 )
@@ -202,11 +205,16 @@ class ModFrameworkAdapter(Protocol):
         """
         ...
 
-    def read_session(self, log_text: str, plugin_file: str) -> LoaderSession | None:
+    def read_session(
+        self,
+        log_text: str,
+        plugin_file: str,
+        written_at: datetime | None = None,
+    ) -> LoaderSession | None:
         """What the log's header says about loading `plugin_file`.
 
-        The absolute answer to "is the running game running the build I just
-        deployed", and the reason `count_loader_starts` is now only a
+        The best available answer to "is the running game running the build I
+        just deployed", and the reason `count_loader_starts` is only a
         fallback. A cursor is a byte offset with no timestamp on it, so it can
         say at best that something changed since the last read -- and it
         cannot even do that reliably, because a loader that truncates its log
@@ -218,10 +226,56 @@ class ModFrameworkAdapter(Protocol):
         same reason: that is where a loader records what it loaded, and it is
         exactly the region a cursor from a previous session skips past.
 
+        `written_at` is when the log file was last written, and exists because
+        a loader may stamp a time that is ambiguous on its own -- BepInEx's is
+        on a 12-hour clock with no AM/PM marker. The last write is a real
+        upper bound on when the session began, which is often enough to settle
+        such a stamp. Adapters whose loader writes an unambiguous time ignore
+        it. Optional so a caller with no file to stat may still ask.
+
         Must not raise, and None must mean "this log does not show it" and
         never "it did not load" -- callers report the difference. An adapter
         for a loader that records nothing usable should return None always,
         which leaves the caller on the fallback rather than on a wrong answer.
+        A partial answer -- the plugin named but no usable timestamp -- is
+        returned as a `LoaderSession` with the unknown fields left None, never
+        as None, because "seen loading, time unknown" and "not seen at all"
+        are different findings and only one of them is worth acting on.
+        """
+        ...
+
+    def inspect_load_recording(self, loader_root: Path) -> LoadRecording:
+        """Report whether this loader records which file each plugin came from.
+
+        Split from `inspect_logging` because the two failures are unrelated
+        and their remedies are different files' worth of apart: that one asks
+        whether a log is written at all, this one asks whether the log says
+        anything about assembly provenance. A loader can pass the first and
+        fail the second, which is the shipped default for BepInEx and the
+        reason `read_session` finds nothing on most installs.
+
+        Must not raise. Like `inspect_logging`, this runs while explaining
+        another result, and an exception here replaces a partial answer with
+        none at all.
+        """
+        ...
+
+    def set_load_recording(
+        self, loader_root: Path, enabled: bool
+    ) -> LoadRecordingChange:
+        """Turn plugin-load recording on or off for this loader tree.
+
+        Writes to the user's own loader config, so it is deliberately its own
+        call rather than something deploy does quietly. It also takes effect
+        only from the loader's next start, which suits the workflow -- the
+        caller is about to ask the user to relaunch anyway.
+
+        May raise `ModwrightError` (unlike the `inspect_` pair), because this
+        one is a direct request with a caller waiting on it: a config that
+        cannot be written is a failure to report, not a detail to omit.
+        Implementations must be idempotent, must preserve every other setting
+        in the file, and must report `changed=False` rather than failing when
+        the setting already reads as asked.
         """
         ...
 

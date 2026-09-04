@@ -8,13 +8,14 @@ and Beat Saber's BSIPA all reuse it, differing only in where they look.
 
 from __future__ import annotations
 
+import codecs
 import errno
 import re
 import shutil
 import subprocess
 import time
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Thread
@@ -28,6 +29,7 @@ from modwright.errors import (
     Il2CppUnsupportedError,
     InvalidDeployRootError,
     InvalidModNameError,
+    LoaderConfigNotFoundError,
     ModReferenceNotFoundError,
     ProjectExistsError,
 )
@@ -37,6 +39,8 @@ from modwright.models import (
     GameContext,
     LoaderInfo,
     LoaderSession,
+    LoadRecording,
+    LoadRecordingChange,
     LoggingStatus,
     PatchTarget,
 )
@@ -293,6 +297,39 @@ def _compiler_errors(build_output: str, limit: int = 15) -> list[str]:
     return seen[:limit]
 
 
+#: The line endings a config line may carry. Named rather than inlined so
+#: the reader and the writer strip exactly the same set.
+NEWLINE_CHARS = "\r\n"
+
+#: Where BepInEx keeps the setting that decides whether Harmony's own
+#: reporting reaches the log. The three `### ...` lines that say which file a
+#: plugin was loaded from, and when, are logged on Harmony's `Info` channel --
+#: verified by decompiling `HarmonyLib.Harmony..ctor`, which wraps exactly
+#: those lines in `Logger.Log(Logger.LogChannel.Info, ...)`.
+_CHANNELS_SECTION = "Harmony.Logger"
+_CHANNELS_KEY = "LogChannels"
+
+#: The channel that carries plugin-load provenance.
+_LOAD_CHANNEL = "Info"
+
+#: The channel that implies every other one, `Info` included.
+_ALL_CHANNELS = "All"
+
+#: The channel name meaning "listen to nothing". Dropped rather than kept when
+#: another channel is added, since the two together are a contradiction.
+_NO_CHANNELS = "None"
+
+#: What BepInEx ships. Used when turning recording back off, because a config
+#: reading `All` cannot have `Info` subtracted from it -- `All` is one token,
+#: not a list -- so the honest reversal is a return to the shipped default.
+_DEFAULT_CHANNELS = "Warn, Error"
+
+#: How far a stamp may sit past the log's last write and still be treated as
+#: belonging to it. Absorbs the disagreement between the game's clock, which
+#: writes the stamp, and the filesystem's, which dates the file.
+_STAMP_SLACK_SECONDS = 2.0
+
+
 def _read_ini_flag(path: Path, section: str, key: str) -> bool | None:
     """Read one boolean out of an ini-shaped config file.
 
@@ -308,6 +345,22 @@ def _read_ini_flag(path: Path, section: str, key: str) -> bool | None:
     more machinery than reading the single key we actually want, and a bare
     except would swallow real bugs along with the malformed configs.
     """
+    match (_read_ini_value(path, section, key) or "").strip().lower():
+        case "true":
+            return True
+        case "false":
+            return False
+        case _:
+            return None  # Absent, unreadable, or not a boolean: claim nothing.
+
+
+def _read_ini_value(path: Path, section: str, key: str) -> str | None:
+    """Read one raw value out of an ini-shaped config file.
+
+    Returns None for a file, section or key that is not there. A key that IS
+    there but empty returns the empty string, which is a different fact: the
+    setting exists and has been cleared.
+    """
     try:
         # utf-8-sig so a byte-order mark cannot glue itself to the first
         # section header and make it never match.
@@ -315,24 +368,117 @@ def _read_ini_flag(path: Path, section: str, key: str) -> bool | None:
     except OSError:
         return None
 
+    for _, _, value in _ini_entries(text.splitlines(), section, key):
+        return value.strip()
+    return None
+
+
+def _ini_entries(
+    lines: list[str], section: str, key: str
+) -> Iterator[tuple[int, str, str]]:
+    """Yield `(index, raw_line, value)` for each `key` inside `section`.
+
+    Shared by the reader and the writer so they can never disagree about what
+    counts as a match -- a writer that resolved a key differently from the
+    reader would edit a line nobody reads back.
+
+    Yields every match rather than the first. BepInEx tolerates a repeated
+    key and honours the last one, so a writer that stopped at the first would
+    leave the value that actually wins untouched.
+    """
     wanted = f"[{section}]"
     in_section = False
-    for raw in text.splitlines():
+    for index, raw in enumerate(lines):
         line = raw.strip()
         if line.startswith("["):
             in_section = line == wanted
         elif in_section and "=" in line and not line.startswith("#"):
             name, _, value = line.partition("=")
-            if name.strip() != key:
-                continue
-            match value.strip().lower():
-                case "true":
-                    return True
-                case "false":
-                    return False
-                case _:
-                    return None  # Present but unreadable: claim nothing.
-    return None
+            if name.strip() == key:
+                yield index, raw, value
+
+
+def _split_channels(value: str | None, keep_case: bool = False) -> Any:
+    """Split a `LogChannels` value into its individual channel names.
+
+    Returns a casefolded set by default, for membership tests that must not
+    care how the user capitalised the file. With `keep_case`, returns a list
+    in the original order and spelling instead -- what a rewrite needs, so
+    that adding one channel does not silently restyle the others.
+
+    Empty and None both yield nothing, which reads as "no channels listed"
+    and, for this setting, is indistinguishable in effect from `None`.
+    """
+    names = [name.strip() for name in (value or "").split(",") if name.strip()]
+    return names if keep_case else {name.casefold() for name in names}
+
+
+def _write_ini_value(path: Path, section: str, key: str, value: str) -> None:
+    """Set one value in an ini-shaped config file, leaving the rest alone.
+
+    A read-modify-write of the whole file rather than a targeted edit, because
+    BepInEx.cfg carries a documentation comment above every setting and the
+    user's own changes beside them. Rewriting only the matched lines keeps all
+    of it: comments, ordering, blank lines, and the settings this call has no
+    opinion about.
+
+    Line endings are preserved per line rather than normalised. BepInEx writes
+    CRLF on Windows, and rewriting a whole config to LF would show up as an
+    every-line diff in a profile the user may well have under version control.
+    That is why the file is opened with newline="" at both ends: Python's
+    default translates line endings on the way in AND on the way out, which
+    silently rewrites every line of a CRLF file read on a LF platform.
+
+    A byte-order mark is preserved for the same reason -- decoding as
+    utf-8-sig drops it, and writing plain utf-8 back would quietly change the
+    first byte of a file this function is only supposed to change one line of.
+
+    Raises `LoaderConfigNotFoundError` if the file is not there. Creating it
+    would be worse than refusing: BepInEx writes this file on its first run
+    with every default spelled out, and a stub containing one section would
+    be silently replaced, taking the edit with it.
+    """
+    try:
+        with path.open(encoding="utf-8-sig", errors="replace", newline="") as handle:
+            text = handle.read()
+        had_bom = path.read_bytes().startswith(codecs.BOM_UTF8)
+    except FileNotFoundError as exc:
+        raise LoaderConfigNotFoundError(
+            f"No BepInEx config at {path}. BepInEx writes it on its first "
+            "run, so this usually means the game has never been launched "
+            "with this loader. Launch it once, then try again."
+        ) from exc
+    except OSError as exc:
+        raise LoaderConfigNotFoundError(
+            f"Could not read the BepInEx config at {path}: {exc}"
+        ) from exc
+
+    lines = text.splitlines(keepends=True)
+    bare = [line.rstrip(NEWLINE_CHARS) for line in lines]
+    matches = list(_ini_entries(bare, section, key))
+    if not matches:
+        raise LoaderConfigNotFoundError(
+            f"{path} has no [{section}] {key} setting to change. BepInEx "
+            "writes every default into this file on startup, so a missing "
+            "one suggests a hand-edited or truncated config; add the setting "
+            "by hand, or delete the file and relaunch to regenerate it."
+        )
+
+    for index, _, _ in matches:
+        # Whatever this line ended with is put back verbatim, so a CRLF
+        # config does not come back with one LF line in the middle of it.
+        ending = lines[index][len(bare[index]) :]
+        lines[index] = f"{key} = {value}{ending}"
+
+    # Written back through a temporary file in the same directory, so an
+    # interrupted write cannot leave the user with a half-written loader
+    # config -- which BepInEx would then refuse to parse, taking out a
+    # working profile in the name of a logging tweak.
+    temp = path.with_suffix(path.suffix + ".modwright-tmp")
+    encoding = "utf-8-sig" if had_bom else "utf-8"
+    with temp.open("w", encoding=encoding, newline="") as handle:
+        handle.write("".join(lines))
+    temp.replace(path)
 
 
 class BepInEx5Adapter:
@@ -891,7 +1037,12 @@ class BepInEx5Adapter:
     #: could pair one plugin's path with the next plugin's timestamp.
     _AT_WITHIN_LINES = 4
 
-    def read_session(self, log_text: str, plugin_file: str) -> LoaderSession | None:
+    def read_session(
+        self,
+        log_text: str,
+        plugin_file: str,
+        written_at: datetime | None = None,
+    ) -> LoaderSession | None:
         """What this log says about loading `plugin_file`, if anything.
 
         Matched on the DLL's filename rather than the mod's announced name:
@@ -928,26 +1079,190 @@ class BepInEx5Adapter:
                 announced = None
                 continue
 
+            best, alternative = self._started_at(lines, index, written_at)
             return LoaderSession(
-                started_at=self._started_at(lines, index),
+                started_at=best,
+                started_at_alternative=alternative,
                 plugin_path=path,
                 plugin_name=announced,
             )
         return None
 
-    def _started_at(self, lines: list[str], index: int) -> datetime | None:
-        """The `### At` stamp belonging to the block starting at `index`."""
+    def _started_at(
+        self, lines: list[str], index: int, written_at: datetime | None
+    ) -> tuple[datetime | None, datetime | None]:
+        """Resolve the `### At` stamp for the block starting at `index`.
+
+        Returns `(best, alternative)`, both of which may be None.
+
+        The stamp needs resolving at all because Harmony formats it with
+        `yyyy-MM-dd hh.mm.ss` -- a LOWERCASE `hh`, which in .NET is the
+        12-hour hour, and no `tt` anywhere to say which half of the day it
+        belongs to. So `### At 2026-09-03 08.05.12` was written at either
+        08:05 or 20:05, and the line itself cannot tell you.
+
+        This was read as 24-hour for as long as the stamp has been read at
+        all, which is wrong for every load at or after noon and wrong in the
+        worst direction: the load reads twelve hours EARLIER than it happened,
+        so a mod deployed and launched in the afternoon looks like it was
+        loaded before it was built. That is reported as "you are running a
+        stale build, quit and relaunch" -- advice that cannot be satisfied,
+        because relaunching reproduces it exactly.
+
+        The last write to the log is what settles it. Everything in the file
+        was written by the session that this stamp belongs to, so the session
+        cannot have begun after the file was last touched. Where that rules
+        out only one of the two readings, the survivor is certain. Where it
+        rules out neither -- a session running long enough to span both -- the
+        nearer reading is returned as `best` and the further one as
+        `alternative`, for the caller to check its conclusion against rather
+        than for this method to silently pick between.
+        """
         for line in lines[index + 1 : index + 1 + self._AT_WITHIN_LINES]:
             found = self._STARTED_AT.match(line)
             if found is None:
                 continue
             try:
-                return datetime.strptime(found.group("stamp"), "%Y-%m-%d %H.%M.%S")
+                # %I is the 12-hour hour, matching .NET's `hh`. Parsed without
+                # a meridiem, it lands on the morning reading by definition.
+                morning = datetime.strptime(found.group("stamp"), "%Y-%m-%d %I.%M.%S")
             except ValueError:
                 # A malformed stamp is unknown, not zero. Falling through to
                 # None keeps it that way.
-                return None
-        return None
+                return None, None
+            return self._resolve_meridiem(morning, written_at)
+        return None, None
+
+    def _resolve_meridiem(
+        self, morning: datetime, written_at: datetime | None
+    ) -> tuple[datetime | None, datetime | None]:
+        """Choose between a 12-hour stamp's two readings. See `_started_at`."""
+        evening = morning + timedelta(hours=12)
+        if written_at is None:
+            # Nothing to test the readings against. Guessing here would be the
+            # original bug with an extra step, so neither is claimed.
+            return None, None
+
+        # Slack for the clocks disagreeing: Harmony stamps from the game's
+        # local time and the mtime comes from the filesystem, and a stamp a
+        # second past the last write is a rounding artefact, not a session
+        # that began in the future.
+        latest = written_at + timedelta(seconds=_STAMP_SLACK_SECONDS)
+        plausible = [when for when in (evening, morning) if when <= latest]
+        if not plausible:
+            # Both readings are after the log's last write. The stamp is from
+            # another day, or a clock moved; either way it is not this
+            # session's and must not be reported as if it were.
+            return None, None
+        if len(plausible) == 1:
+            return plausible[0], None
+        # Both fit. Nearest first -- a session that started 20 minutes ago is
+        # likelier than one that started 12 hours and 20 minutes ago -- but
+        # the loser is handed back rather than dropped.
+        return plausible[0], plausible[1]
+
+    def inspect_load_recording(self, loader_root: Path) -> LoadRecording:
+        config_path = self._config_path(loader_root)
+        if not config_path.is_file():
+            return LoadRecording(
+                enabled=False,
+                config_path=None,
+                hint=(
+                    f"There is no BepInEx config at {config_path} to read this "
+                    "from. BepInEx writes it on its first run, so this loader "
+                    "has most likely never been launched. Launch the game once "
+                    "and ask again."
+                ),
+            )
+
+        setting = _read_ini_value(config_path, _CHANNELS_SECTION, _CHANNELS_KEY)
+        channels = _split_channels(setting)
+        enabled = bool({_LOAD_CHANNEL.casefold(), _ALL_CHANNELS.casefold()} & channels)
+        if enabled:
+            return LoadRecording(
+                enabled=True,
+                config_path=config_path,
+                setting=setting,
+                hint=None,
+            )
+        return LoadRecording(
+            enabled=False,
+            config_path=config_path,
+            setting=setting,
+            hint=(
+                f"[{_CHANNELS_SECTION}] {_CHANNELS_KEY} = "
+                f"{setting if setting is not None else '(unset)'} in "
+                f"{config_path}. Harmony logs the file each plugin was loaded "
+                f"from, and when, on its '{_LOAD_CHANNEL}' channel, and this "
+                "setting is not listening to it -- which is what BepInEx "
+                "ships, not something that was turned off here. Until it is "
+                "listening, the log cannot say which build is running. "
+                f"`set_load_recording` adds '{_LOAD_CHANNEL}' to this line; it "
+                "takes effect at the game's next start."
+            ),
+        )
+
+    def set_load_recording(
+        self, loader_root: Path, enabled: bool
+    ) -> LoadRecordingChange:
+        config_path = self._config_path(loader_root)
+        previous = _read_ini_value(config_path, _CHANNELS_SECTION, _CHANNELS_KEY)
+        channels = _split_channels(previous)
+        already = bool({_LOAD_CHANNEL.casefold(), _ALL_CHANNELS.casefold()} & channels)
+
+        if already == enabled:
+            # Asked for what it already reads. A no-op, and a success: an
+            # agent calling this before every deploy should not be told off
+            # for it.
+            if not config_path.is_file():
+                raise LoaderConfigNotFoundError(
+                    f"No BepInEx config at {config_path}. BepInEx writes it on "
+                    "its first run, so this usually means the game has never "
+                    "been launched with this loader. Launch it once, then try "
+                    "again."
+                )
+            return LoadRecordingChange(
+                enabled=enabled,
+                changed=False,
+                config_path=config_path,
+                previous=previous,
+                current=previous,
+            )
+
+        if enabled:
+            # Added to whatever is already there rather than replacing it. The
+            # user's other channels are theirs, and `All` is deliberately not
+            # used: BepInEx's own comment on this setting warns that the IL
+            # channel dumps whole patch bodies, which would bury the log this
+            # exists to make readable.
+            kept = [name for name in _split_channels(previous, keep_case=True)
+                    if name.casefold() != _NO_CHANNELS.casefold()]
+            current = ", ".join([*kept, _LOAD_CHANNEL])
+        else:
+            kept = [name for name in _split_channels(previous, keep_case=True)
+                    if name.casefold() != _LOAD_CHANNEL.casefold()]
+            # `All` cannot have one channel subtracted from it -- it is a
+            # single token standing for every channel, so removing `Info`
+            # would mean spelling out the rest and guessing at what the user
+            # meant. Returning to the shipped default is the one reversal that
+            # claims nothing.
+            current = (
+                _DEFAULT_CHANNELS
+                if any(n.casefold() == _ALL_CHANNELS.casefold() for n in kept)
+                else ", ".join(kept) or _NO_CHANNELS
+            )
+
+        _write_ini_value(config_path, _CHANNELS_SECTION, _CHANNELS_KEY, current)
+        return LoadRecordingChange(
+            enabled=enabled,
+            changed=True,
+            config_path=config_path,
+            previous=previous,
+            current=current,
+        )
+
+    def _config_path(self, loader_root: Path) -> Path:
+        return loader_root / "BepInEx" / "config" / "BepInEx.cfg"
 
     def inspect_logging(self, loader_root: Path) -> LoggingStatus:
         config_path = loader_root / "BepInEx" / "config" / "BepInEx.cfg"

@@ -151,15 +151,44 @@ def fake_profile(tmp_path: Path):
     return _build
 
 
-def write_bepinex_config(loader_root: Path, *, disk_logging: bool) -> Path:
+def write_bepinex_config(
+    loader_root: Path,
+    *,
+    disk_logging: bool,
+    log_channels: str | None = "Warn, Error",
+    newline: str = "\n",
+) -> Path:
     """Write a BepInEx.cfg shaped like a real one.
 
     Deliberately not a two-line stub: the real file surrounds the key with
     `##` doc comments, `#` metadata lines and other sections, and a decoy
     `Enabled` in a different section. Parsing that is the actual job.
+
+    `log_channels` defaults to what BepInEx SHIPS, not to what a developer
+    machine ends up with. That default is the whole reason plugin-load
+    recording needs turning on, so a fixture that quietly enabled it would
+    test a configuration most installs never have. Pass None to leave the
+    section out entirely, as a hand-trimmed config would.
+
+    `newline` exists because the real file is CRLF on Windows and rewriting
+    it must not silently convert the whole thing.
     """
     path = loader_root / "BepInEx" / "config" / "BepInEx.cfg"
     path.parent.mkdir(parents=True, exist_ok=True)
+    channels = (
+        ""
+        if log_channels is None
+        else (
+            "[Harmony.Logger]\n"
+            "\n"
+            "## Specifies which Harmony log channels to listen to.\n"
+            "## NOTE: IL channel dumps the whole patch methods, use only when needed!\n"
+            "# Setting type: LogChannel\n"
+            "# Default value: Warn, Error\n"
+            f"LogChannels = {log_channels}\n"
+            "\n"
+        )
+    )
     path.write_text(
         "[Caching]\n"
         "\n"
@@ -168,6 +197,7 @@ def write_bepinex_config(loader_root: Path, *, disk_logging: bool) -> Path:
         "# Default value: true\n"
         "EnableAssemblyCache = true\n"
         "\n"
+        + channels +
         "[Logging.Console]\n"
         "\n"
         "## Enables showing a console for log output.\n"
@@ -187,6 +217,7 @@ def write_bepinex_config(loader_root: Path, *, disk_logging: bool) -> Path:
         "# Default value: true\n"
         f"Enabled = {'true' if disk_logging else 'false'}\n",
         encoding="utf-8",
+        newline=newline,
     )
     return path
 

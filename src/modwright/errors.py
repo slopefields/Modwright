@@ -51,6 +51,10 @@ class ErrorCode(StrEnum):
     DECOMPILER_UNAVAILABLE = "decompiler_unavailable"
     #: The adapter exists but has not implemented this step yet.
     NOT_IMPLEMENTED = "not_implemented"
+    #: The loader's own config file is not there to read or change. It is
+    #: written on the loader's first run, so this usually means the game has
+    #: never been launched with this loader tree.
+    LOADER_CONFIG_NOT_FOUND = "loader_config_not_found"
 
 
 class ModwrightError(Exception):
@@ -142,3 +146,7 @@ class DecompilerUnavailableError(ModwrightError):
 
 class AdapterStepNotImplementedError(ModwrightError):
     code = ErrorCode.NOT_IMPLEMENTED
+
+
+class LoaderConfigNotFoundError(ModwrightError):
+    code = ErrorCode.LOADER_CONFIG_NOT_FOUND

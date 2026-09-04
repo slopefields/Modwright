@@ -60,9 +60,16 @@ def _stamp(*, hours_ago: int) -> str:
 
     Whole seconds, because that is the resolution HarmonyX writes and the
     reason the comparison carries a second of slack.
+
+    `%I`, not `%H`: HarmonyX formats this with `yyyy-MM-dd hh.mm.ss`, and .NET's
+    lowercase `hh` is the TWELVE-hour hour, with no `tt` to say which half of
+    the day it is. This fixture used to write a 24-hour stamp, which no loader
+    ever produces, and every test over these lines passed against a shape that
+    only existed here -- while the parser read real afternoon stamps as
+    morning ones and called a fresh build stale.
     """
     when = datetime.now() - timedelta(hours=hours_ago)
-    return when.strftime("%Y-%m-%d %H.%M.%S")
+    return when.strftime("%Y-%m-%d %I.%M.%S")
 
 
 def _startup_block(artifact, stamp: str) -> str:

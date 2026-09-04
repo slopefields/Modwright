@@ -695,6 +695,49 @@ def set_deploy_target(project_path: str, deploy_root: str | None) -> dict[str, A
 
 @mcp.tool()
 @_tool
+def set_load_recording(project_path: str, enabled: bool = True) -> dict[str, Any]:
+    """Make the mod loader record which file it loaded each plugin from.
+
+    Turn this on once per deploy target to get a decisive answer from
+    `watch_mod_logs` about whether the running game is running the build you
+    just deployed. Without it the loader writes a healthy log that says
+    nothing about where its plugins came from, and that question can only be
+    answered by inference.
+
+    This edits the loader's own config file in the deploy target, so it is a
+    deliberate call rather than something `deploy_mod` does quietly, and it
+    takes effect at the game's NEXT start. Pass `enabled=False` to put the
+    setting back.
+    """
+    project = Path(project_path)
+    config = ProjectConfig.load(project)
+    adapter = get_adapter(config.framework_id)
+    context = detect_framework(config.install_root)
+    if config.deploy_root:
+        context = adapter.adopt_loader_root(context, Path(config.deploy_root))
+
+    change = adapter.set_load_recording(context.loader_root, enabled)
+    response = {
+        "success": True,
+        "enabled": change.enabled,
+        "changed": change.changed,
+        "config_path": str(change.config_path),
+        "previous": change.previous,
+        "current": change.current,
+    }
+    if change.changed:
+        response["hints"] = [
+            "The loader reads this file at startup, so the change applies "
+            "from the game's next launch -- not to a game that is running "
+            "now.",
+            "This also turns on the loader's reporting of every patch it "
+            "applies, so the log will be busier than before.",
+        ]
+    return response
+
+
+@mcp.tool()
+@_tool
 def set_game_install(project_path: str, install_root: str) -> dict[str, Any]:
     """Point a project at the game install on THIS machine.
 
@@ -1003,6 +1046,16 @@ def watch_mod_logs(
             },
         )
 
+    # Read BEFORE the log is parsed, because the parse needs it: BepInEx's
+    # load stamp is on a 12-hour clock with no AM/PM marker, and the last
+    # write is the upper bound that settles which half of the day it means.
+    log_written_at = mtime_of(log_path)
+    # File times move around this codebase as POSIX floats; a parsed stamp is
+    # a datetime. Converted once here so the adapter compares like with like.
+    log_written_when = (
+        datetime.fromtimestamp(log_written_at) if log_written_at is not None else None
+    )
+
     read = read_since(
         log_path,
         since_cursor=since_cursor,
@@ -1016,7 +1069,7 @@ def watch_mod_logs(
         # Only askable once there is a file to ask about: an older project
         # never recorded one, and the fallback below covers it.
         read_session=(
-            (lambda text: adapter.read_session(text, artifact.name))
+            (lambda text: adapter.read_session(text, artifact.name, log_written_when))
             if artifact is not None
             else None
         ),
@@ -1025,7 +1078,6 @@ def watch_mod_logs(
     # the tail of whatever is already there, which can be weeks old, and the
     # text alone cannot be told apart from a live session. One timestamp does
     # not settle it either -- there has to be something to compare it against.
-    log_written_at = mtime_of(log_path)
     deployed_at = last_deployed(context, artifact)
     session = read.session
     running = _running_this_build(read, since_cursor, deployed_at)
@@ -1047,6 +1099,24 @@ def watch_mod_logs(
         ),
     }
     hints: list[str] = []
+
+    if session is not None and session.started_at_alternative is not None:
+        # Both readings of a 12-hour stamp survived, and the nearer one was
+        # taken. Quoted rather than hidden, because the reader can often rule
+        # one out from knowledge this process does not have -- whether the
+        # game has been up since this morning.
+        response["plugin_loaded_at_alternative"] = (
+            session.started_at_alternative.isoformat(timespec="seconds")
+        )
+        hints.append(
+            "The loader stamps its load time on a 12-hour clock with no AM/PM "
+            f"marker, so this load reads as either {response['plugin_loaded_at']} "
+            f"or {response['plugin_loaded_at_alternative']}, and the log does "
+            "not say which. The earlier of the two was ruled out only if the "
+            "game has been running since then -- `running_this_build` is "
+            "computed from the later reading. If the game has genuinely been "
+            "up for more than twelve hours, prefer the other one."
+        )
 
     if session is not None and artifact is not None and session.plugin_path is not None:
         if _resolved(session.plugin_path) != _resolved(artifact):

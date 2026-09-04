@@ -88,6 +88,62 @@ class LoggingStatus:
 
 
 @dataclass(frozen=True)
+class LoadRecording:
+    """Whether a loader tree records WHICH file it loaded each plugin from.
+
+    A separate question from `LoggingStatus`, which asks whether a log is
+    written at all. A loader can write a perfectly healthy log and still say
+    nothing about where the assemblies in it came from -- BepInEx does exactly
+    that out of the box, because the lines carrying that detail belong to
+    Harmony's `Info` channel and the shipped default listens only to warnings
+    and errors.
+
+    That default is why `read_session` comes back empty on most installs: the
+    evidence it looks for is real, and simply not printed. This type is what
+    lets a caller say so, and offer to turn it on, instead of reporting an
+    unexplained "unknown".
+
+    `enabled` is a plain bool rather than a tri-state because both unreadable
+    and absent configs mean the same thing here: the detail is not known to be
+    on, and the remedy is identical either way. That is the opposite of
+    `LoggingStatus.disabled`, where the default is ON and only a positive
+    reading may be trusted -- here the default is OFF.
+    """
+
+    enabled: bool
+    #: The file the setting lives in, or None when there is no config yet.
+    config_path: Path | None = None
+    #: The setting as it currently reads, for a caller to quote rather than
+    #: describe. None when it could not be read.
+    setting: str | None = None
+    #: The adapter's own wording for what this costs and how to change it.
+    #: Framework-specific, so the adapter owns it and the server never
+    #: paraphrases it.
+    hint: str | None = None
+
+
+@dataclass(frozen=True)
+class LoadRecordingChange:
+    """The result of turning plugin-load recording on or off.
+
+    `changed` is False for a no-op -- the setting already read the way it was
+    asked to -- which is not a failure and must not be reported as one. An
+    agent that calls this defensively before every deploy should see a quiet
+    success, not a warning.
+    """
+
+    #: What the setting reads now.
+    enabled: bool
+    #: Whether this call actually rewrote the file.
+    changed: bool
+    config_path: Path
+    #: The value before and after, verbatim, so the caller can show the edit
+    #: rather than assert it happened.
+    previous: str | None = None
+    current: str | None = None
+
+
+@dataclass(frozen=True)
 class BuildOutcome:
     """Result of an adapter's build step.
 
@@ -180,6 +236,18 @@ class LoaderSession:
     #: When the loader loaded the mod, from the log's own text. None when the
     #: log carries no such stamp -- unknown, never "it did not happen".
     started_at: datetime | None = None
+    #: The OTHER time `started_at` could mean, when the loader wrote a stamp
+    #: that does not identify itself uniquely. BepInEx's comes from Harmony,
+    #: which formats it on a 12-hour clock with no AM/PM marker, so `01.39.17`
+    #: is either 01:39 or 13:39 and nothing in the line says which.
+    #:
+    #: `started_at` holds the reading that best fits when the log was last
+    #: written; this holds the one that was rejected. It is not a footnote:
+    #: the two are 12 hours apart, so a caller comparing `started_at` against
+    #: a build time must check whether the alternative would flip its answer
+    #: before presenting that answer as certain. None means the stamp was
+    #: unambiguous, or that there was no stamp at all.
+    started_at_alternative: datetime | None = None
     #: The file the loader says it loaded the mod from. Compared against the
     #: deploy destination, this catches a stale copy loading out of another
     #: tree, which a startup banner alone cannot see.
