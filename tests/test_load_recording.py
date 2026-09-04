@@ -296,3 +296,27 @@ class TestTwelveHourStamp:
 
         assert session.started_at is None
         assert session.plugin_path is not None
+
+
+class TestTheToolResolvesItsTarget:
+    def test_a_loader_inside_the_game_folder_is_found(
+        self, fake_game, tmp_path
+    ):
+        """`GameContext.loader_root` is None whenever BepInEx lives in the game
+        folder rather than a manager profile, and the tool has to fall back to
+        the install root. Passing the raw field through built a path under a
+        `None` root and failed with a TypeError naming nothing useful."""
+        from modwright import server
+        from modwright.project_config import ProjectConfig
+        from conftest import write_bepinex_config
+
+        game = fake_game("Game")
+        write_bepinex_config(game, disk_logging=True)
+        path = tmp_path / "in-game-proj"
+        path.mkdir()
+        ProjectConfig("MyMod", "bepinex5", str(game), "Game").save(path)
+
+        result = server.set_load_recording(str(path))
+
+        assert result["success"] is True
+        assert result["current"] == "Warn, Error, Info"

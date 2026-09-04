@@ -131,6 +131,7 @@ def fake_profile(tmp_path: Path):
         plugins: bool = True,
         log: bool = False,
         disk_logging: bool | None = None,
+        log_channels: str | None = "Warn, Error",
     ) -> Path:
         root = tmp_path / manager / game_folder / "profiles" / name
         loader = root / "BepInEx"
@@ -144,7 +145,9 @@ def fake_profile(tmp_path: Path):
         if disk_logging is not None:
             # None leaves no config at all, which is the state of a profile
             # BepInEx has never started in.
-            write_bepinex_config(root, disk_logging=disk_logging)
+            write_bepinex_config(
+                root, disk_logging=disk_logging, log_channels=log_channels
+            )
         (root / "doorstop_config.ini").write_text("enabled = true\n", encoding="utf-8")
         return root
 

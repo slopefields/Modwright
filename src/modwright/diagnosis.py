@@ -69,6 +69,23 @@ LOADER_WROTE_NOTHING = "loader_wrote_nothing"
 #: means the running game still holds the old build, and mid-session it means
 #: nothing at all.
 NO_RESTART_SINCE_LAST_READ = "no_restart_since_last_read"
+#: The loader is not recording which file it loaded each plugin from, so the
+#: log cannot say which build is running however healthy it looks. This is the
+#: SHIPPED default rather than something switched off, which is why it is
+#: reported with a remedy rather than as a misconfiguration.
+LOADS_NOT_RECORDED = "loads_not_recorded"
+#: The loader IS recording plugin loads and this mod is not among them. A
+#: different finding entirely from the one above, and a much louder one: the
+#: log covers a session that did not load this mod at all.
+LOAD_NOT_IN_LOG = "load_not_in_log"
+#: The load was recorded, but its timestamp could not be pinned down -- a
+#: stamp that resolves to a time the log itself rules out. Rare, and reported
+#: rather than rounded off, because a load time nobody believes must not be
+#: compared against a build time as though it were sound.
+LOAD_TIME_UNUSABLE = "load_time_unusable"
+#: There is no deployed artifact to date the comparison against. Nothing was
+#: ever put there, or what was recorded has since been removed.
+NOTHING_DEPLOYED = "nothing_deployed"
 
 _ASK_DONT_SWITCH = (
     "Ask the user which profile they launched -- do not switch the deploy "
@@ -305,6 +322,114 @@ def last_deployed(context: GameContext, artifact: Path | None = None) -> float |
     except OSError:
         return None
     return max(stamps, default=None)
+
+
+def explain_unknown_build_verdict(
+    context: GameContext,
+    adapter: Any,
+    artifact: Path | None,
+    session: LoaderSession | None,
+    deployed_at: float | None,
+) -> dict[str, Any]:
+    """Say WHY it is not known whether the running game holds this build.
+
+    `running_this_build` may come back unknown, and unknown is the right
+    answer in every case this explains -- the point is never to turn one of
+    them into a verdict. The point is that the four situations behind it have
+    four different remedies, and a bare `null` tells them apart for nobody.
+
+    That is not a nicety. The adapter contract states that a missing load
+    record "must mean 'this log does not show it' and never 'it did not
+    load' -- callers report the difference", and this is the caller. Until
+    this existed the difference went unreported, and the observed result was
+    an agent abandoning the tool and grepping the log by hand.
+
+    Cheap by construction, because this runs on a poll. It reads one small
+    config file at most and never touches profile discovery, which is the
+    expensive half of `diagnose_silence` and deliberately kept off this path.
+    Once plugin-load recording is on, the common case stops being reached at
+    all -- the verdict is decisive and nothing here runs.
+    """
+    loader_root = context.effective_loader_root
+
+    if deployed_at is None:
+        return _payload(
+            NOTHING_DEPLOYED,
+            loader_root,
+            hints=[
+                "There is no deployed build to compare the log against: "
+                f"{artifact} is not on disk."
+                if artifact is not None
+                else "This project has no recorded deploy yet.",
+                "Run `deploy_mod`, then launch the game and poll again.",
+            ],
+        )
+
+    if session is None:
+        # Which of these two it is turns entirely on a setting in the
+        # loader's own config, so it is asked rather than assumed. Asking is
+        # one small file read; assuming would report a mod that never loaded
+        # and a mod whose loader never mentions anything as the same failure.
+        recording = adapter.inspect_load_recording(loader_root)
+        if not recording.enabled:
+            return _payload(
+                LOADS_NOT_RECORDED,
+                loader_root,
+                hints=[
+                    # Deliberately short: the adapter's hint below carries the
+                    # file, the setting and the remedy in the framework's own
+                    # words, and repeating any of that here would spend an
+                    # agent's context saying the same thing twice.
+                    "The log does not record which file any plugin was loaded "
+                    "from, so it cannot say which build is running.",
+                    recording.hint,
+                    "Call `set_load_recording` on this project, then have the "
+                    "user relaunch. The setting is read at startup, so it "
+                    "does nothing for a game that is already running.",
+                    "Until then the log is still worth reading -- it just "
+                    "cannot answer this particular question.",
+                ],
+            )
+        return _payload(
+            LOAD_NOT_IN_LOG,
+            loader_root,
+            hints=[
+                "This loader IS recording where it loads plugins from, and "
+                f"{artifact.name if artifact else 'this mod'} is not among "
+                "them. The session in this log did not load it.",
+                "Check that the mod is in the loader's plugins folder and "
+                "that the loader did not fail before reaching it -- the log "
+                "itself will say so.",
+                "If the game has not been relaunched since the setting was "
+                "changed, this is expected: the previous session was still "
+                "running without it.",
+            ],
+        )
+
+    if session.started_at is None:
+        return _payload(
+            LOAD_TIME_UNUSABLE,
+            loader_root,
+            hints=[
+                "The load was recorded but its timestamp could not be "
+                "trusted: it resolves to a time this log rules out. A clock "
+                "that moved between sessions is the usual cause.",
+                "Compare `log_written_at` against the log's own stamps by "
+                "hand, or relaunch to get a fresh session to read.",
+            ],
+        )
+
+    # Every unknown is covered above: the verdict is only unknown when one of
+    # those three is missing. Reached only if that stops being true, so it
+    # names its own surprise rather than pretending to a reason.
+    return _payload(
+        LOAD_TIME_UNUSABLE,
+        loader_root,
+        hints=[
+            "The load record and the build time are both present, yet no "
+            "verdict was reached. This should not happen; report it.",
+        ],
+    )
 
 
 def _payload(reason: str, loader_root: Path, hints: list[str]) -> dict[str, Any]:

@@ -22,7 +22,11 @@ from modwright import server
 from modwright.adapters import detect_framework
 from modwright.adapters.bepinex5 import BepInEx5Adapter
 from modwright.diagnosis import (
+    LOAD_NOT_IN_LOG,
+    LOAD_TIME_UNUSABLE,
+    LOADS_NOT_RECORDED,
     NO_RESTART_SINCE_LAST_READ,
+    NOTHING_DEPLOYED,
     NOTHING_RAN_SINCE_DEPLOY,
     LOADER_WROTE_NOTHING,
     LOGGING_DISABLED,
@@ -840,3 +844,149 @@ class TestAPollIsBounded:
         assert "Chainloader started" not in result["content"]
         assert result["running_this_build"] is True
         assert "diagnosis" not in result
+
+
+class TestUnknownVerdictExplainsItself:
+    """A blank `running_this_build` has to say WHY it is blank.
+
+    Four situations produce it and they have four different remedies, so a
+    bare null tells them apart for nobody. The adapter contract is explicit
+    that a missing load record "must mean 'this log does not show it' and
+    never 'it did not load' -- callers report the difference"; these pin that
+    reporting down at the caller.
+
+    Not hypothetical. Before this existed the blank arrived with no reason
+    attached, and what actually happened was that the tool got abandoned
+    mid-session in favour of grepping the log by hand.
+    """
+
+    @pytest.fixture()
+    def project(self, fake_game, profile, tmp_path, only_these_profiles):
+        def _build(**profile_kwargs):
+            game = fake_game("Game")
+            profile_kwargs.setdefault("disk_logging", True)
+            target = profile("target", log=True, **profile_kwargs)
+            only_these_profiles(target)
+            path = tmp_path / "unknown-proj"
+            path.mkdir(exist_ok=True)
+            ProjectConfig(
+                "MyMod", "bepinex5", str(game), "Game", deploy_root=str(target)
+            ).save(path)
+            return path, target / "BepInEx" / "LogOutput.log"
+
+        return _build
+
+    def test_the_shipped_default_is_named_along_with_its_remedy(self, project):
+        """The common case, and the whole reason the explanation exists: the
+        log is healthy, it simply never records where plugins came from."""
+        path, log = project()
+        artifact = _deploy(log.parent.parent)
+        _record_deploy(path, artifact)
+        log.write_text("[Info   :   BepInEx] Chainloader started\n", encoding="utf-8")
+
+        unknown = server.watch_mod_logs(str(path))["running_this_build_unknown"]
+
+        assert unknown["reason"] == LOADS_NOT_RECORDED
+        assert any("set_load_recording" in hint for hint in unknown["hints"])
+
+    def test_the_default_is_not_reported_as_someone_turning_it_off(self, project):
+        """A user reading this must not go hunting for who disabled it."""
+        path, log = project()
+        artifact = _deploy(log.parent.parent)
+        _record_deploy(path, artifact)
+        log.write_text("[Info   :   BepInEx] Chainloader started\n", encoding="utf-8")
+
+        unknown = server.watch_mod_logs(str(path))["running_this_build_unknown"]
+
+        assert any("what BepInEx ships" in hint for hint in unknown["hints"])
+
+    def test_the_reason_is_not_stated_twice(self, project):
+        """These hints go to an agent, and the adapter's wording already
+        carries the file, the setting and the remedy. Saying it again above
+        spends context to add nothing."""
+        path, log = project()
+        artifact = _deploy(log.parent.parent)
+        _record_deploy(path, artifact)
+        log.write_text("[Info   :   BepInEx] Chainloader started\n", encoding="utf-8")
+
+        unknown = server.watch_mod_logs(str(path))["running_this_build_unknown"]
+
+        repeated = [h for h in unknown["hints"] if "turned off here" in h]
+        assert len(repeated) == 1
+
+    def test_recording_on_but_this_mod_absent_is_a_different_finding(self, project):
+        """Much louder than the default case: the loader IS reporting what it
+        loads, and this mod is not in the list. It did not load."""
+        path, log = project(log_channels="Warn, Error, Info")
+        artifact = _deploy(log.parent.parent)
+        _record_deploy(path, artifact)
+        log.write_text(
+            _startup_block(
+                artifact.parent / "SomeoneElse.dll", _stamp(hours_ago=1)
+            ),
+            encoding="utf-8",
+        )
+
+        unknown = server.watch_mod_logs(str(path))["running_this_build_unknown"]
+
+        assert unknown["reason"] == LOAD_NOT_IN_LOG
+
+    def test_a_missing_artifact_is_reported_as_nothing_deployed(self, project):
+        """No build time to compare against, so the question cannot be asked
+        -- which is a different problem from the log being uninformative."""
+        path, log = project()
+        artifact = _deploy(log.parent.parent)
+        _record_deploy(path, artifact)
+        artifact.unlink()
+        log.write_text("[Info   :   BepInEx] Chainloader started\n", encoding="utf-8")
+
+        unknown = server.watch_mod_logs(str(path))["running_this_build_unknown"]
+
+        assert unknown["reason"] == NOTHING_DEPLOYED
+
+    def test_a_stamp_the_log_rules_out_is_not_quietly_believed(self, project):
+        """A load time nobody believes must not be compared against a build
+        time as though it were sound.
+
+        A whole day ahead, not a few hours: on a 12-hour clock the earlier
+        reading of an afternoon stamp lands in the morning and stays perfectly
+        plausible, so only a different DATE puts both readings beyond the log
+        that contains them. That is what a clock jumping forward looks like.
+        """
+        path, log = project(log_channels="All")
+        artifact = _deploy(log.parent.parent)
+        _record_deploy(path, artifact)
+        ahead = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d %I.%M.%S")
+        log.write_text(_startup_block(artifact, ahead), encoding="utf-8")
+
+        unknown = server.watch_mod_logs(str(path))["running_this_build_unknown"]
+
+        assert unknown["reason"] == LOAD_TIME_UNUSABLE
+
+    def test_a_known_verdict_carries_no_explanation(self, project):
+        """The explanation is for the blank. A decided answer needs none, and
+        attaching one anyway would make every response look like a problem."""
+        path, log = project(log_channels="Warn, Error, Info")
+        artifact = _deploy(log.parent.parent, age_days=1)
+        _record_deploy(path, artifact)
+        log.write_text(_startup_block(artifact, _stamp(hours_ago=1)), encoding="utf-8")
+
+        result = server.watch_mod_logs(str(path))
+
+        assert result["running_this_build"] is True
+        assert "running_this_build_unknown" not in result
+
+    def test_explaining_the_blank_does_not_scan_for_profiles(self, project, monkeypatch):
+        """This runs on a poll. Profile discovery is the expensive half of the
+        other diagnosis and must stay off this path."""
+        path, log = project()
+        artifact = _deploy(log.parent.parent)
+        _record_deploy(path, artifact)
+        log.write_text("[Info   :   BepInEx] Chainloader started\n", encoding="utf-8")
+
+        def _fail():
+            raise AssertionError("discovery ran while explaining a blank verdict")
+
+        monkeypatch.setattr("modwright.diagnosis.discover_profiles", _fail)
+
+        assert server.watch_mod_logs(str(path))["running_this_build_unknown"]

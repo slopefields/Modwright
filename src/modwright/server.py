@@ -22,6 +22,7 @@ from modwright.adapters import detect_framework, get_adapter
 from modwright.diagnosis import (
     diagnose_no_restart,
     diagnose_silence,
+    explain_unknown_build_verdict,
     last_deployed,
     mtime_of,
 )
@@ -709,14 +710,12 @@ def set_load_recording(project_path: str, enabled: bool = True) -> dict[str, Any
     takes effect at the game's NEXT start. Pass `enabled=False` to put the
     setting back.
     """
-    project = Path(project_path)
-    config = ProjectConfig.load(project)
-    adapter = get_adapter(config.framework_id)
-    context = detect_framework(config.install_root)
-    if config.deploy_root:
-        context = adapter.adopt_loader_root(context, Path(config.deploy_root))
+    context, adapter, _ = _context_for_project(Path(project_path))
 
-    change = adapter.set_load_recording(context.loader_root, enabled)
+    # `effective_loader_root`, not `loader_root`: the latter is None whenever
+    # the loader lives in the game folder itself, and writing the setting into
+    # a path under a `None` root fails with a TypeError naming nothing useful.
+    change = adapter.set_load_recording(context.effective_loader_root, enabled)
     response = {
         "success": True,
         "enabled": change.enabled,
@@ -1099,6 +1098,15 @@ def watch_mod_logs(
         ),
     }
     hints: list[str] = []
+
+    if running is None:
+        # An unknown verdict used to arrive as a bare null, which reads as the
+        # tool being broken and is indistinguishable from three other
+        # situations with three other remedies. The adapter contract puts the
+        # duty of telling them apart on this caller; this is where it is done.
+        response["running_this_build_unknown"] = explain_unknown_build_verdict(
+            context, adapter, artifact, session, deployed_at
+        )
 
     if session is not None and session.started_at_alternative is not None:
         # Both readings of a 12-hour stamp survived, and the nearer one was
