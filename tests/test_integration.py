@@ -28,7 +28,9 @@ pytestmark = pytest.mark.game
 def real_project(game_install, tmp_path):
     """A scaffolded project targeting the real installed game."""
     project = tmp_path / "TestMod"
-    result = server.scaffold_mod_project(str(game_install), str(project), "TestMod")
+    result = asyncio.run(
+        server.scaffold_mod_project(str(game_install), str(project), "TestMod")
+    )
     assert result["success"], result
     return project
 

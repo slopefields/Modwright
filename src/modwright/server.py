@@ -17,8 +17,10 @@ from pathlib import Path
 from typing import Any, Callable
 
 from mcp.server import MCPServer
+from mcp.server.mcpserver import Context
 
 from modwright.adapters import detect_framework, get_adapter
+from modwright.confirmation import confirm_new_project
 from modwright.diagnosis import (
     diagnose_no_restart,
     diagnose_silence,
@@ -279,26 +281,56 @@ def detect_game(install_root: str) -> dict[str, Any]:
 
 
 @mcp.tool()
-@_tool
-def scaffold_mod_project(
+@_async_tool
+async def scaffold_mod_project(
     install_root: str,
     project_path: str,
     mod_name: str,
+    ctx: Context | None = None,
 ) -> dict[str, Any]:
     """Create a buildable mod project targeting a specific game install.
 
     References to the game's own assemblies are resolved automatically from the
     detected install, which is the step framework templates leave manual.
 
-    Where the mod DEPLOYS is a separate decision, made with `set_deploy_target`
-    and asked about per project. Scaffolding deliberately cannot set it: the
-    target is the one field that must not be inherited from whatever the last
-    project used, and taking it here let a caller supply a profile nobody had
-    chosen. `deploy_mod` refuses until it is set, and lists the candidates.
+    Before anything is written, the detected game, the mod's name and the
+    deploy target are put to the USER through the client, not assumed from
+    these arguments. A new project is where every one of those gets decided,
+    and an agent that has seen one project on this machine will otherwise
+    supply that project's answers for the next one. A client with no
+    elicitation support cannot be asked; the response then says `confirmed:
+    false` so it is visible which of the two happened.
+
+    Where the mod DEPLOYS still cannot be passed in as an argument. The target
+    is the one field that must not be inherited from whatever the last project
+    used, and taking it here let a caller supply a profile nobody had chosen --
+    which is the whole reason it is asked about instead. Left unanswered it
+    stays unset, and `deploy_mod` refuses until it is, listing the candidates.
     """
     context = detect_framework(install_root)
     adapter = get_adapter(context.framework_id)
     project = Path(project_path)
+
+    profiles = (
+        discover_profiles(context.game_name) if adapter.supports_deploy_target else []
+    )
+    confirmation = await confirm_new_project(
+        ctx,
+        game_name=context.game_name,
+        install_root=context.install_root,
+        project_path=project,
+        mod_name=mod_name,
+        profiles=profiles,
+    )
+    if confirmation is not None:
+        mod_name = confirmation.mod_name
+        if confirmation.deploy_root:
+            # Adopted before scaffolding, so the generated build file is
+            # written against the loader the mod will actually run under, and
+            # so an unusable choice fails before any file exists.
+            context = adapter.adopt_loader_root(
+                context, Path(confirmation.deploy_root)
+            )
 
     written = adapter.scaffold(project, context, mod_name)
     config = ProjectConfig(
@@ -314,15 +346,26 @@ def scaffold_mod_project(
         "success": True,
         "project_path": str(project),
         "framework": adapter.display_name,
+        "game_name": context.game_name,
+        "mod_name": mod_name,
         "deploy_root": config.deploy_root,
+        "confirmed": confirmation is not None,
         "files_written": [str(p) for p in written],
     }
+    hints: list[str] = []
+    if confirmation is None:
+        hints.append(
+            "This client cannot be asked questions directly (it declares no "
+            "elicitation support), so the game, the mod name and the deploy "
+            "target were taken from the arguments unverified. Confirm all "
+            "three with the user before writing any code."
+        )
     if adapter.supports_deploy_target and config.deploy_root is None:
         # Said at scaffold time rather than left for `deploy_mod` to refuse.
         # The decision is the user's and it is cheapest to make now, while
         # they are already deciding things about this project.
         response["deploy_target_required"] = True
-        response["hints"] = [
+        hints += [
             "This project has no deploy target yet. Ask which profile it "
             "should install into, then set it with set_deploy_target -- "
             "list_mod_profiles shows the candidates with their mod counts.",
@@ -330,6 +373,8 @@ def scaffold_mod_project(
             "profile is active per launch, so a mod deployed into the wrong "
             "one builds, deploys, and then loads nothing.",
         ]
+    if hints:
+        response["hints"] = hints
     return response
 
 

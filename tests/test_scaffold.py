@@ -138,14 +138,19 @@ class TestRefusals:
             BepInEx5Adapter().scaffold(project, context, "MyMod")
 
 
-class TestTheDeployTargetIsNotChosenHere:
-    """Scaffolding deliberately cannot set a deploy target.
+class TestTheDeployTargetIsNotAnArgument:
+    """Scaffolding cannot be TOLD a deploy target, only answered one.
 
     It used to take one, which meant an agent could pass a profile carried
     over from whatever project it worked on last -- and that is exactly what
     happened: a new project silently inherited the previous one's profile and
     had to be moved by hand afterwards. The refusal in `deploy_mod` exists to
     force that choice, and an optional argument here walked straight past it.
+
+    The user is now asked directly instead (see `test_confirmation.py`), which
+    is the same decision made by the one party entitled to make it. Left
+    unanswered -- or asked of a client that cannot answer -- the target stays
+    unset and `deploy_mod` still refuses.
 
     Only one profile is active per launch, so the wrong one builds, deploys
     and then loads nothing.
@@ -160,10 +165,14 @@ class TestTheDeployTargetIsNotChosenHere:
         assert "deploy_root" not in parameters
 
     def test_a_new_project_starts_with_no_target(self, fake_game, tmp_path):
+        import asyncio
+
         from modwright import server
 
-        result = server.scaffold_mod_project(
-            str(fake_game("Game")), str(tmp_path / "proj"), "MyMod"
+        result = asyncio.run(
+            server.scaffold_mod_project(
+                str(fake_game("Game")), str(tmp_path / "proj"), "MyMod"
+            )
         )
 
         assert result["success"] is True
@@ -175,10 +184,14 @@ class TestTheDeployTargetIsNotChosenHere:
         """Rather than waiting for `deploy_mod` to refuse. The decision is the
         user's, and it is cheapest to make while they are already deciding
         things about this project."""
+        import asyncio
+
         from modwright import server
 
-        result = server.scaffold_mod_project(
-            str(fake_game("Game")), str(tmp_path / "proj"), "MyMod"
+        result = asyncio.run(
+            server.scaffold_mod_project(
+                str(fake_game("Game")), str(tmp_path / "proj"), "MyMod"
+            )
         )
 
         assert result["deploy_target_required"] is True

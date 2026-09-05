@@ -51,6 +51,10 @@ class ErrorCode(StrEnum):
     DECOMPILER_UNAVAILABLE = "decompiler_unavailable"
     #: The adapter exists but has not implemented this step yet.
     NOT_IMPLEMENTED = "not_implemented"
+    #: The user was asked to confirm what a new project targets and did not.
+    #: Distinct from every other refusal here: nothing is wrong with the
+    #: arguments, they were simply never agreed to. Nothing was written.
+    NOT_CONFIRMED = "not_confirmed"
     #: The loader's own config file is not there to read or change. It is
     #: written on the loader's first run, so this usually means the game has
     #: never been launched with this loader tree.
@@ -150,3 +154,7 @@ class AdapterStepNotImplementedError(ModwrightError):
 
 class LoaderConfigNotFoundError(ModwrightError):
     code = ErrorCode.LOADER_CONFIG_NOT_FOUND
+
+
+class NotConfirmedError(ModwrightError):
+    code = ErrorCode.NOT_CONFIRMED
